@@ -1,0 +1,3047 @@
+import { useReducer, useEffect, useRef, useState } from 'react';
+
+const ACTIONS = {
+  LOAD_DATA: 'LOAD_DATA',
+  ADD_SUBJECT: 'ADD_SUBJECT',
+  UPDATE_SUBJECT: 'UPDATE_SUBJECT',
+  DELETE_SUBJECT: 'DELETE_SUBJECT',
+  ADD_CARD: 'ADD_CARD',
+  DELETE_CARD: 'DELETE_CARD',
+  UPDATE_CARD: 'UPDATE_CARD',
+  SET_VIEW: 'SET_VIEW',
+  SET_CURRENT_SUBJECT: 'SET_CURRENT_SUBJECT',
+  START_SESSION: 'START_SESSION',
+  START_GLOBAL_SESSION: 'START_GLOBAL_SESSION',
+  END_SESSION: 'END_SESSION',
+  SHOW_ANSWER: 'SHOW_ANSWER',
+  GRADE_CARD: 'GRADE_CARD',
+  SET_FORM: 'SET_FORM',
+  RESET_FORM: 'RESET_FORM',
+  START_TIMER: 'START_TIMER',
+  DISMISS_FLUENCY_WARNING: 'DISMISS_FLUENCY_WARNING',
+  LOAD_GAMIFICATION: 'LOAD_GAMIFICATION',
+  SET_DAILY_GOAL: 'SET_DAILY_GOAL',
+  DISMISS_ACHIEVEMENT: 'DISMISS_ACHIEVEMENT',
+  BULK_ADD_CARDS: 'BULK_ADD_CARDS',
+  // Productivity actions
+  ADD_FOCUS_LOG: 'ADD_FOCUS_LOG',
+  ADD_QUESTION_LOG: 'ADD_QUESTION_LOG',
+  UPDATE_QUESTION_LOG: 'UPDATE_QUESTION_LOG',
+  DELETE_QUESTION_LOG: 'DELETE_QUESTION_LOG',
+  ADD_DAILY_EVENT: 'ADD_DAILY_EVENT'
+};
+
+const initialState = {
+  subjects: [],
+  cards: [],
+  currentView: 'subjects', // subjects | subject-detail | study | focus | questions
+  currentSubjectId: null,
+  session: null,
+  form: { question: '', answer: '', tags: '', difficulty: 3 },
+  gamification: {
+    currentStreak: 0,
+    bestStreak: 0,
+    lastStudyDate: null,
+    dailyGoal: 20,
+    cardsReviewedToday: 0,
+    todayDate: null,
+    totalStudyTime: 0,
+    todayStudyTime: 0,
+    achievements: []
+  },
+  // Productivity data
+  focusLogs: [],
+  questionLogs: [],
+  dailyHistory: [] // Histórico de eventos do dia
+};
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+const getToday = () => {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+};
+
+const getDaysBetween = (date1Str, date2Str) => {
+  const d1 = new Date(date1Str);
+  const d2 = new Date(date2Str);
+  const diffTime = Math.abs(d2 - d1);
+  return Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+};
+
+const updateStreak = (lastStudyDate, currentStreak) => {
+  const today = getToday();
+  if (!lastStudyDate) return { currentStreak: 1, lastStudyDate: today, streakBroken: false };
+  if (lastStudyDate === today) return { currentStreak, lastStudyDate: today, streakBroken: false };
+  const daysDiff = getDaysBetween(lastStudyDate, today);
+  if (daysDiff === 1) return { currentStreak: currentStreak + 1, lastStudyDate: today, streakBroken: false };
+  return { currentStreak: 1, lastStudyDate: today, streakBroken: true };
+};
+
+const checkAchievements = (state, cardsCompleted) => {
+  const achievements = [];
+  const newCardsToday = state.gamification.cardsReviewedToday + cardsCompleted;
+  
+  if (newCardsToday >= state.gamification.dailyGoal && state.gamification.cardsReviewedToday < state.gamification.dailyGoal) {
+    achievements.push({
+      id: `goal_${Date.now()}`,
+      type: 'goal',
+      title: '🎯 Meta Diária Alcançada!',
+      message: `Você revisou ${state.gamification.dailyGoal} cartões hoje!`,
+      timestamp: Date.now()
+    });
+  }
+  
+  const streakUpdate = updateStreak(state.gamification.lastStudyDate, state.gamification.currentStreak);
+  if (streakUpdate.currentStreak > state.gamification.bestStreak) {
+    achievements.push({
+      id: `streak_${Date.now()}`,
+      type: 'streak',
+      title: '🏆 Novo Recorde de Sequência!',
+      message: `${streakUpdate.currentStreak} dias consecutivos!`,
+      timestamp: Date.now()
+    });
+  }
+  
+  if (streakUpdate.currentStreak === 7 && state.gamification.currentStreak < 7) {
+    achievements.push({
+      id: `week_${Date.now()}`,
+      type: 'milestone',
+      title: '⭐ Uma Semana Completa!',
+      message: 'Você estudou por 7 dias seguidos!',
+      timestamp: Date.now()
+    });
+  }
+  
+  if (streakUpdate.currentStreak === 30 && state.gamification.currentStreak < 30) {
+    achievements.push({
+      id: `month_${Date.now()}`,
+      type: 'milestone',
+      title: '🌟 Um Mês de Dedicação!',
+      message: '30 dias consecutivos de estudo!',
+      timestamp: Date.now()
+    });
+  }
+  
+  return { achievements, streakUpdate };
+};
+
+const migrateGamification = (data) => {
+  const today = getToday();
+  return {
+    currentStreak: data?.currentStreak ?? 0,
+    bestStreak: data?.bestStreak ?? 0,
+    lastStudyDate: data?.lastStudyDate ?? null,
+    dailyGoal: data?.dailyGoal ?? 20,
+    cardsReviewedToday: data?.todayDate === today ? (data?.cardsReviewedToday ?? 0) : 0,
+    todayDate: today,
+    totalStudyTime: data?.totalStudyTime ?? 0,
+    todayStudyTime: data?.todayDate === today ? (data?.todayStudyTime ?? 0) : 0,
+    achievements: []
+  };
+};
+
+const RESPONSE_TIME_THRESHOLDS = {
+  VERY_FAST: 8000,
+  FAST: 15000,
+  NORMAL: 45000,
+  SLOW: 75000,
+  VERY_SLOW: 120000
+};
+
+const calculateEMA = (currentAvg, newValue, alpha = 0.3) => {
+  if (currentAvg === null || currentAvg === undefined || currentAvg === 0) return newValue;
+  return alpha * newValue + (1 - alpha) * currentAvg;
+};
+
+const detectFalseFluency = (grade, responseTime) => {
+  if (grade === 'easy' && responseTime > RESPONSE_TIME_THRESHOLDS.NORMAL) return true;
+  if (grade === 'good' && responseTime > RESPONSE_TIME_THRESHOLDS.SLOW) return true;
+  return false;
+};
+
+const adjustGradeByResponseTime = (originalGrade, responseTime) => {
+  if (originalGrade === 'easy' && responseTime > RESPONSE_TIME_THRESHOLDS.NORMAL) return 'good';
+  return originalGrade;
+};
+
+const getTimeBasedModifier = (grade, responseTime) => {
+  if (grade === 'wrong') return 1.0;
+  if (responseTime < RESPONSE_TIME_THRESHOLDS.VERY_FAST) return 1.1;
+  if (responseTime > RESPONSE_TIME_THRESHOLDS.SLOW) return 0.85;
+  if (responseTime > RESPONSE_TIME_THRESHOLDS.VERY_SLOW) return 0.7;
+  return 1.0;
+};
+
+const intelligentInterleave = (cards) => {
+  if (cards.length <= 2) return cards;
+  const tagGroups = {};
+  const noTag = [];
+  
+  cards.forEach(card => {
+    if (card.tags && card.tags.trim()) {
+      const tag = card.tags.trim().split(',')[0].trim().toLowerCase();
+      if (!tagGroups[tag]) tagGroups[tag] = [];
+      tagGroups[tag].push(card);
+    } else {
+      noTag.push(card);
+    }
+  });
+  
+  const tagKeys = Object.keys(tagGroups);
+  if (tagKeys.length > 1) {
+    const interleaved = [];
+    let maxLength = Math.max(...tagKeys.map(k => tagGroups[k].length));
+    for (let i = 0; i < maxLength; i++) {
+      tagKeys.forEach(tag => {
+        if (tagGroups[tag][i]) interleaved.push(tagGroups[tag][i]);
+      });
+    }
+    return [...interleaved, ...noTag];
+  }
+  
+  return shuffleArray(cards);
+};
+
+const shuffleArray = (array) => {
+  const shuffled = [...array];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled;
+};
+
+const getDueCards = (cards) => {
+  const now = Date.now();
+  return cards.filter(card => card.nextReview <= now);
+};
+
+const calculateNextReview = (interval) => {
+  return Date.now() + (interval * 24 * 60 * 60 * 1000);
+};
+
+const migrateCard = (card) => {
+  return {
+    ...card,
+    totalReviews: card.totalReviews ?? 0,
+    correctStreak: card.correctStreak ?? 0,
+    wrongCount: card.wrongCount ?? 0,
+    lastReviewedAt: card.lastReviewedAt ?? null,
+    easeFactor: card.easeFactor ?? 2.5,
+    lastResponseTime: card.lastResponseTime ?? null,
+    averageResponseTime: card.averageResponseTime ?? null,
+    subjectId: card.subjectId ?? null
+  };
+};
+
+const calculateNewStats = (card, grade, responseTime) => {
+  const now = Date.now();
+  const adjustedGrade = adjustGradeByResponseTime(grade, responseTime);
+  const isFalseFluency = detectFalseFluency(grade, responseTime);
+  
+  let newInterval = card.interval;
+  let newEaseFactor = card.easeFactor;
+  let newCorrectStreak = card.correctStreak;
+  let newWrongCount = card.wrongCount;
+  let shouldRequeue = false;
+
+  // ========================================================================
+  // FASE 1: LEARNING STEPS (cartões novos ou com poucas revisões)
+  // ========================================================================
+  const isLearningPhase = card.totalReviews < 3;
+  
+  if (isLearningPhase) {
+    // Durante aprendizado inicial, usar intervalos fixos e simples
+    // NÃO usar easeFactor nem multiplicadores de tempo ainda
+    
+    if (adjustedGrade === 'wrong') {
+      // Errou: resetar progresso, voltar para a fila
+      newCorrectStreak = 0;
+      newWrongCount = card.wrongCount + 1;
+      newInterval = 1; // Revisar amanhã
+      shouldRequeue = true; // Volta para o final da sessão atual
+    } else if (adjustedGrade === 'good') {
+      // Acertou normalmente: revisar amanhã
+      newCorrectStreak = card.correctStreak + 1;
+      newInterval = 1; // 1 dia
+    } else if (adjustedGrade === 'easy') {
+      // Achou fácil: pular para 3 dias
+      newCorrectStreak = card.correctStreak + 1;
+      newInterval = 3; // 3 dias
+    }
+    
+    // easeFactor permanece estável durante learning (sem mudanças)
+    // Isso garante que o cartão comece com base sólida de 2.5
+  
+  // ========================================================================
+  // FASE 2: GRADUATED (cartão já passou da fase inicial)
+  // ========================================================================
+  } else {
+    // Agora sim usar algoritmo completo com easeFactor e multiplicadores
+    
+    if (adjustedGrade === 'wrong') {
+      // Penalidade: reduzir easeFactor e voltar ao início
+      newCorrectStreak = 0;
+      newWrongCount = card.wrongCount + 1;
+      newEaseFactor = Math.max(1.3, card.easeFactor - 0.2);
+      newInterval = 1;
+      shouldRequeue = true;
+      
+    } else if (adjustedGrade === 'good') {
+      // Progressão normal com easeFactor atual
+      newCorrectStreak = card.correctStreak + 1;
+      newInterval = Math.max(1, Math.ceil(card.interval * newEaseFactor));
+      
+    } else if (adjustedGrade === 'easy') {
+      // Bônus: aumentar easeFactor e aplicar multiplicador 1.3x
+      newCorrectStreak = card.correctStreak + 1;
+      newEaseFactor = Math.min(3.0, card.easeFactor + 0.15);
+      newInterval = Math.max(1, Math.ceil(card.interval * newEaseFactor * 1.3));
+    }
+    
+    // Aplicar modificador por tempo de resposta (graduated only)
+    const timeModifier = getTimeBasedModifier(adjustedGrade, responseTime);
+    newInterval = Math.max(1, Math.ceil(newInterval * timeModifier));
+    
+    // ========================================================================
+    // LIMITADOR DE CRESCIMENTO: evita saltos exagerados
+    // ========================================================================
+    // O novo intervalo nunca pode crescer mais que 2.2x o anterior
+    // Isso torna a progressão mais previsível e segura
+    const maxAllowedInterval = Math.ceil(card.interval * 2.2);
+    if (newInterval > maxAllowedInterval) {
+      newInterval = maxAllowedInterval;
+    }
+  }
+  
+  // Atualizar média de tempo de resposta (sempre)
+  const newAverageResponseTime = calculateEMA(card.averageResponseTime, responseTime);
+
+  return {
+    interval: newInterval,
+    easeFactor: newEaseFactor,
+    correctStreak: newCorrectStreak,
+    wrongCount: newWrongCount,
+    nextReview: calculateNextReview(newInterval),
+    totalReviews: card.totalReviews + 1,
+    lastReviewedAt: now,
+    lastResponseTime: responseTime,
+    averageResponseTime: newAverageResponseTime,
+    shouldRequeue,
+    isFalseFluency,
+    wasGradeAdjusted: adjustedGrade !== grade,
+    isLearningPhase // informação extra para debugging/UI futura
+  };
+};
+
+const parseBulkText = (text) => {
+  const lines = text.trim().split('\n').filter(line => line.trim());
+  const cards = [];
+  
+  lines.forEach(line => {
+    let question = '';
+    let answer = '';
+    
+    if (line.includes('=')) {
+      [question, answer] = line.split('=').map(s => s.trim());
+    } else if (line.includes('|')) {
+      [question, answer] = line.split('|').map(s => s.trim());
+    } else if (line.includes(':')) {
+      [question, answer] = line.split(':').map(s => s.trim());
+    }
+    
+    if (question && answer) {
+      cards.push({ question, answer });
+    }
+  });
+  
+  return cards;
+};
+
+// Migração de dados antigos
+const migrateOldData = (oldCards) => {
+  const subjects = [];
+  const subjectMap = new Map();
+  
+  // Extrair matérias únicas dos cards antigos
+  oldCards.forEach(card => {
+    const subjectName = card.subject || 'Geral';
+    const normalizedName = subjectName.trim();
+    
+    if (!subjectMap.has(normalizedName.toLowerCase())) {
+      const newSubject = {
+        id: `subject_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        name: normalizedName,
+        color: 'blue',
+        createdAt: Date.now()
+      };
+      subjects.push(newSubject);
+      subjectMap.set(normalizedName.toLowerCase(), newSubject.id);
+    }
+  });
+  
+  // Vincular cards às matérias
+  const migratedCards = oldCards.map(card => {
+    const subjectName = card.subject || 'Geral';
+    const subjectId = subjectMap.get(subjectName.trim().toLowerCase());
+    const { subject, ...cardWithoutSubject } = card;
+    return {
+      ...cardWithoutSubject,
+      subjectId
+    };
+  });
+  
+  return { subjects, cards: migratedCards };
+};
+
+// ============================================================================
+// ANALYTICS & STATISTICS HELPERS
+// ============================================================================
+
+const getSubjectProgress = (cards, subjects, focusLogs) => {
+  const today = getToday();
+  const stats = {};
+  
+  subjects.forEach(subject => {
+    const subjectCards = cards.filter(c => c.subjectId === subject.id);
+    const totalCards = subjectCards.length;
+    
+    const masteredCards = subjectCards.filter(c => 
+      c.correctStreak >= 3 && c.easeFactor >= 2.5
+    ).length;
+    
+    const overdueCards = subjectCards.filter(c => 
+      c.nextReview <= Date.now()
+    ).length;
+    
+    const todayFocus = focusLogs
+      .filter(log => log.date === today && log.subject === subject.id)
+      .reduce((sum, log) => sum + log.minutes, 0);
+    
+    const uniqueDates = [...new Set(
+      focusLogs
+        .filter(log => log.subject === subject.id)
+        .map(log => log.date)
+    )].sort().reverse();
+    
+    let streak = 0;
+    for (let i = 0; i < uniqueDates.length; i++) {
+      const expectedDate = new Date();
+      expectedDate.setDate(expectedDate.getDate() - i);
+      const expected = `${expectedDate.getFullYear()}-${String(expectedDate.getMonth() + 1).padStart(2, '0')}-${String(expectedDate.getDate()).padStart(2, '0')}`;
+      if (uniqueDates[i] === expected) {
+        streak++;
+      } else {
+        break;
+      }
+    }
+    
+    stats[subject.id] = {
+      name: subject.name,
+      totalCards,
+      masteredCards,
+      overdueCards,
+      todayFocusMinutes: todayFocus,
+      streak,
+      masteredPercentage: totalCards > 0 ? (masteredCards / totalCards * 100).toFixed(1) : 0
+    };
+  });
+  
+  return stats;
+};
+
+const getCriticalCards = (cards, subjects) => {
+  const scoredCards = cards.map(card => {
+    const wrongScore = Math.min(card.wrongCount * 20, 100);
+    const timeScore = card.averageResponseTime 
+      ? Math.min((card.averageResponseTime / 1000 / 60) * 10, 100)
+      : 0;
+    const easeScore = 100 - ((card.easeFactor - 1.3) / (3.0 - 1.3) * 100);
+    
+    const criticalityScore = (wrongScore * 0.5) + (easeScore * 0.3) + (timeScore * 0.2);
+    
+    return {
+      ...card,
+      criticalityScore
+    };
+  });
+  
+  return scoredCards
+    .filter(c => c.totalReviews > 0)
+    .sort((a, b) => b.criticalityScore - a.criticalityScore)
+    .slice(0, 5)
+    .map(card => {
+      const subject = subjects.find(s => s.id === card.subjectId);
+      return {
+        id: card.id,
+        question: card.question,
+        wrongCount: card.wrongCount,
+        averageResponseTime: card.averageResponseTime,
+        easeFactor: card.easeFactor,
+        subjectName: subject?.name || 'Sem matéria',
+        criticalityScore: card.criticalityScore.toFixed(1)
+      };
+    });
+};
+
+const getTodayEvents = (dailyHistory) => {
+  const today = getToday();
+  return dailyHistory
+    .filter(event => event.date === today)
+    .sort((a, b) => b.timestamp - a.timestamp);
+};
+
+const createDailyEvent = (type, description, subjectId = null) => {
+  return {
+    id: `event_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+    type,
+    description,
+    subjectId,
+    date: getToday(),
+    timestamp: Date.now()
+  };
+};
+
+const formatEventTime = (timestamp) => {
+  const date = new Date(timestamp);
+  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+};
+
+// ============================================================================
+// REDUCER
+// ============================================================================
+
+function appReducer(state, action) {
+  switch (action.type) {
+    case ACTIONS.LOAD_DATA: {
+      const { subjects, cards, gamification, focusLogs, questionLogs, dailyHistory } = action.payload;
+      return {
+        ...state,
+        subjects: subjects || [],
+        cards: cards.map(migrateCard) || [],
+        gamification: migrateGamification(gamification),
+        focusLogs: focusLogs || [],
+        questionLogs: questionLogs || [],
+        dailyHistory: dailyHistory || []
+      };
+    }
+
+    case ACTIONS.ADD_SUBJECT: {
+      const newSubject = {
+        id: `subject_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        name: action.payload.name.trim(),
+        color: action.payload.color || 'blue',
+        createdAt: Date.now()
+      };
+      return {
+        ...state,
+        subjects: [...state.subjects, newSubject]
+      };
+    }
+
+    case ACTIONS.UPDATE_SUBJECT: {
+      return {
+        ...state,
+        subjects: state.subjects.map(subject =>
+          subject.id === action.payload.id
+            ? { ...subject, ...action.payload.updates }
+            : subject
+        )
+      };
+    }
+
+    case ACTIONS.DELETE_SUBJECT: {
+      return {
+        ...state,
+        subjects: state.subjects.filter(s => s.id !== action.payload),
+        cards: state.cards.map(card => 
+          card.subjectId === action.payload 
+            ? { ...card, subjectId: null }
+            : card
+        ),
+        currentSubjectId: state.currentSubjectId === action.payload ? null : state.currentSubjectId
+      };
+    }
+
+    case ACTIONS.ADD_CARD: {
+      const newCard = {
+        id: `card_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        question: action.payload.question.trim(),
+        answer: action.payload.answer.trim(),
+        tags: action.payload.tags.trim(),
+        difficulty: parseInt(action.payload.difficulty),
+        subjectId: action.payload.subjectId,
+        interval: 1,
+        nextReview: Date.now(),
+        totalReviews: 0,
+        correctStreak: 0,
+        wrongCount: 0,
+        lastReviewedAt: null,
+        easeFactor: 2.5,
+        lastResponseTime: null,
+        averageResponseTime: null
+      };
+      return {
+        ...state,
+        cards: [...state.cards, newCard],
+        form: initialState.form
+      };
+    }
+
+    case ACTIONS.BULK_ADD_CARDS: {
+      const newCards = action.payload.cards.map(cardData => ({
+        id: `card_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        question: cardData.question.trim(),
+        answer: cardData.answer.trim(),
+        tags: cardData.tags || '',
+        difficulty: 3,
+        subjectId: action.payload.subjectId,
+        interval: 1,
+        nextReview: Date.now(),
+        totalReviews: 0,
+        correctStreak: 0,
+        wrongCount: 0,
+        lastReviewedAt: null,
+        easeFactor: 2.5,
+        lastResponseTime: null,
+        averageResponseTime: null
+      }));
+      return {
+        ...state,
+        cards: [...state.cards, ...newCards]
+      };
+    }
+
+    case ACTIONS.DELETE_CARD:
+      return {
+        ...state,
+        cards: state.cards.filter(card => card.id !== action.payload)
+      };
+
+    case ACTIONS.UPDATE_CARD:
+      return {
+        ...state,
+        cards: state.cards.map(card =>
+          card.id === action.payload.id ? { ...card, ...action.payload.updates } : card
+        )
+      };
+
+    case ACTIONS.SET_VIEW:
+      return {
+        ...state,
+        currentView: action.payload
+      };
+
+    case ACTIONS.SET_CURRENT_SUBJECT:
+      return {
+        ...state,
+        currentSubjectId: action.payload,
+        currentView: action.payload ? 'subject-detail' : 'subjects'
+      };
+
+    case ACTIONS.START_SESSION: {
+      const subjectCards = state.cards.filter(c => c.subjectId === action.payload);
+      const dueCards = getDueCards(subjectCards);
+      const queue = intelligentInterleave(dueCards);
+      return {
+        ...state,
+        currentView: 'study',
+        session: {
+          subjectId: action.payload,
+          queue,
+          currentIndex: 0,
+          showAnswer: false,
+          completed: 0,
+          processedIds: new Set(),
+          startTime: null,
+          currentResponseTime: null,
+          falseFluencyWarning: null,
+          sessionStartTime: Date.now(),
+          cardsCompletedThisSession: 0
+        }
+      };
+    }
+
+    case ACTIONS.START_GLOBAL_SESSION: {
+      const dueCards = getDueCards(state.cards);
+      const queue = intelligentInterleave(dueCards);
+      return {
+        ...state,
+        currentView: 'study',
+        session: {
+          subjectId: null,
+          queue,
+          currentIndex: 0,
+          showAnswer: false,
+          completed: 0,
+          processedIds: new Set(),
+          startTime: null,
+          currentResponseTime: null,
+          falseFluencyWarning: null,
+          sessionStartTime: Date.now(),
+          cardsCompletedThisSession: 0
+        }
+      };
+    }
+
+    case ACTIONS.END_SESSION: {
+      if (!state.session) return state;
+      const sessionDuration = Date.now() - state.session.sessionStartTime;
+      const cardsCompleted = state.session.cardsCompletedThisSession;
+      const today = getToday();
+      const { achievements, streakUpdate } = checkAchievements(state, cardsCompleted);
+      const newBestStreak = Math.max(state.gamification.bestStreak, streakUpdate.currentStreak);
+      
+      const sessionEvent = createDailyEvent(
+        'session_end',
+        `${cardsCompleted} ${cardsCompleted === 1 ? 'cartão revisado' : 'cartões revisados'}`,
+        state.session.subjectId
+      );
+      
+      return {
+        ...state,
+        session: null,
+        currentView: state.session.subjectId ? 'subject-detail' : 'subjects',
+        gamification: {
+          ...state.gamification,
+          currentStreak: streakUpdate.currentStreak,
+          bestStreak: newBestStreak,
+          lastStudyDate: streakUpdate.lastStudyDate,
+          cardsReviewedToday: state.gamification.cardsReviewedToday + cardsCompleted,
+          todayDate: today,
+          todayStudyTime: state.gamification.todayStudyTime + sessionDuration,
+          totalStudyTime: state.gamification.totalStudyTime + sessionDuration,
+          achievements: achievements
+        },
+        dailyHistory: [...state.dailyHistory, sessionEvent]
+      };
+    }
+
+    case ACTIONS.START_TIMER:
+      return {
+        ...state,
+        session: { ...state.session, startTime: Date.now(), currentResponseTime: null }
+      };
+
+    case ACTIONS.SHOW_ANSWER: {
+      const responseTime = state.session.startTime ? Date.now() - state.session.startTime : null;
+      return {
+        ...state,
+        session: { ...state.session, showAnswer: true, currentResponseTime: responseTime }
+      };
+    }
+
+    case ACTIONS.DISMISS_FLUENCY_WARNING: {
+      if (state.session?.pendingEndSession) {
+        const sessionDuration = Date.now() - state.session.sessionStartTime;
+        const cardsCompleted = state.session.cardsCompletedThisSession;
+        const today = getToday();
+        const { achievements, streakUpdate } = checkAchievements(state, cardsCompleted);
+        const newBestStreak = Math.max(state.gamification.bestStreak, streakUpdate.currentStreak);
+        
+        return {
+          ...state,
+          session: null,
+          currentView: state.session.subjectId ? 'subject-detail' : 'subjects',
+          gamification: {
+            ...state.gamification,
+            currentStreak: streakUpdate.currentStreak,
+            bestStreak: newBestStreak,
+            lastStudyDate: streakUpdate.lastStudyDate,
+            cardsReviewedToday: state.gamification.cardsReviewedToday + cardsCompleted,
+            todayDate: today,
+            todayStudyTime: state.gamification.todayStudyTime + sessionDuration,
+            totalStudyTime: state.gamification.totalStudyTime + sessionDuration,
+            achievements: achievements
+          }
+        };
+      }
+      return { ...state, session: { ...state.session, falseFluencyWarning: null } };
+    }
+
+    case ACTIONS.DISMISS_ACHIEVEMENT:
+      return {
+        ...state,
+        gamification: {
+          ...state.gamification,
+          achievements: state.gamification.achievements.filter(a => a.id !== action.payload)
+        }
+      };
+
+    case ACTIONS.GRADE_CARD: {
+      if (!state.session) return state;
+
+      const currentCard = state.session.queue[state.session.currentIndex];
+      const responseTime = state.session.currentResponseTime || 0;
+      const stats = calculateNewStats(currentCard, action.payload, responseTime);
+
+      const updatedCards = state.cards.map(card =>
+        card.id === currentCard.id
+          ? {
+              ...card,
+              interval: stats.interval,
+              easeFactor: stats.easeFactor,
+              correctStreak: stats.correctStreak,
+              wrongCount: stats.wrongCount,
+              nextReview: stats.nextReview,
+              totalReviews: stats.totalReviews,
+              lastReviewedAt: stats.lastReviewedAt,
+              lastResponseTime: stats.lastResponseTime,
+              averageResponseTime: stats.averageResponseTime
+            }
+          : card
+      );
+
+      let newQueue = [...state.session.queue];
+      let nextIndex = state.session.currentIndex + 1;
+      const newProcessedIds = new Set(state.session.processedIds);
+      newProcessedIds.add(currentCard.id);
+
+      if (stats.shouldRequeue && !state.session.processedIds.has(currentCard.id)) {
+        const updatedCard = updatedCards.find(c => c.id === currentCard.id);
+        newQueue.push(updatedCard);
+      }
+
+      const isLastCard = nextIndex >= newQueue.length;
+
+      if (isLastCard) {
+        if (stats.isFalseFluency) {
+          return {
+            ...state,
+            cards: updatedCards,
+            session: {
+              ...state.session,
+              queue: newQueue,
+              currentIndex: nextIndex,
+              showAnswer: true,
+              completed: state.session.completed + 1,
+              processedIds: newProcessedIds,
+              cardsCompletedThisSession: state.session.cardsCompletedThisSession + 1,
+              falseFluencyWarning: {
+                grade: action.payload,
+                adjustedGrade: stats.wasGradeAdjusted ? 'good' : action.payload,
+                responseTime: responseTime
+              },
+              pendingEndSession: true
+            }
+          };
+        }
+        
+        const sessionDuration = Date.now() - state.session.sessionStartTime;
+        const cardsCompleted = state.session.cardsCompletedThisSession + 1;
+        const today = getToday();
+        const { achievements, streakUpdate } = checkAchievements(state, cardsCompleted);
+        const newBestStreak = Math.max(state.gamification.bestStreak, streakUpdate.currentStreak);
+        
+        return {
+          ...state,
+          cards: updatedCards,
+          session: null,
+          currentView: state.session.subjectId ? 'subject-detail' : 'subjects',
+          gamification: {
+            ...state.gamification,
+            currentStreak: streakUpdate.currentStreak,
+            bestStreak: newBestStreak,
+            lastStudyDate: streakUpdate.lastStudyDate,
+            cardsReviewedToday: state.gamification.cardsReviewedToday + cardsCompleted,
+            todayDate: today,
+            todayStudyTime: state.gamification.todayStudyTime + sessionDuration,
+            totalStudyTime: state.gamification.totalStudyTime + sessionDuration,
+            achievements: achievements
+          }
+        };
+      }
+
+      return {
+        ...state,
+        cards: updatedCards,
+        session: {
+          ...state.session,
+          queue: newQueue,
+          currentIndex: nextIndex,
+          showAnswer: false,
+          completed: state.session.completed + 1,
+          processedIds: newProcessedIds,
+          startTime: null,
+          currentResponseTime: null,
+          cardsCompletedThisSession: state.session.cardsCompletedThisSession + 1,
+          falseFluencyWarning: stats.isFalseFluency ? {
+            grade: action.payload,
+            adjustedGrade: stats.wasGradeAdjusted ? 'good' : action.payload,
+            responseTime: responseTime
+          } : null
+        }
+      };
+    }
+
+    case ACTIONS.SET_DAILY_GOAL:
+      return { ...state, gamification: { ...state.gamification, dailyGoal: action.payload } };
+
+    case ACTIONS.SET_FORM:
+      return { ...state, form: { ...state.form, [action.payload.field]: action.payload.value } };
+
+    case ACTIONS.RESET_FORM:
+      return { ...state, form: initialState.form };
+
+    // Productivity actions
+    case ACTIONS.ADD_FOCUS_LOG:
+      return {
+        ...state,
+        focusLogs: [...state.focusLogs, action.payload]
+      };
+
+    case ACTIONS.ADD_QUESTION_LOG:
+      return {
+        ...state,
+        questionLogs: [...state.questionLogs, action.payload]
+      };
+
+    case ACTIONS.UPDATE_QUESTION_LOG:
+      return {
+        ...state,
+        questionLogs: state.questionLogs.map(log =>
+          log.id === action.payload.id ? { ...log, ...action.payload.updates } : log
+        )
+      };
+
+    case ACTIONS.DELETE_QUESTION_LOG:
+      return {
+        ...state,
+        questionLogs: state.questionLogs.filter(log => log.id !== action.payload)
+      };
+
+    case ACTIONS.ADD_DAILY_EVENT:
+      return {
+        ...state,
+        dailyHistory: [...state.dailyHistory, action.payload]
+      };
+
+    default:
+      return state;
+  }
+}
+
+// ============================================================================
+// UI COMPONENTS
+// ============================================================================
+
+const AchievementNotification = ({ achievement, onDismiss }) => (
+  <div className="bg-gradient-to-r from-amber-400 to-orange-500 text-white p-4 rounded-xl shadow-2xl animate-bounce backdrop-blur-sm"
+       style={{ animationIterationCount: 3 }}>
+    <div className="flex items-start gap-3">
+      <div className="text-2xl">{achievement.title.split(' ')[0]}</div>
+      <div className="flex-1">
+        <div className="font-bold text-base">{achievement.title.substring(2)}</div>
+        <div className="text-sm opacity-90 mt-0.5">{achievement.message}</div>
+      </div>
+      <button onClick={onDismiss} className="text-white hover:text-gray-100 transition-colors text-xl font-light">
+        ×
+      </button>
+    </div>
+  </div>
+);
+
+const ProgressBar = ({ current, total, showLabel = true }) => {
+  const percentage = total > 0 ? Math.min(100, (current / total) * 100) : 0;
+  
+  return (
+    <div className="space-y-2">
+      {showLabel && (
+        <div className="flex justify-between items-center text-sm">
+          <span className="font-medium text-gray-700">Progresso</span>
+          <span className="text-gray-600">{current} / {total}</span>
+        </div>
+      )}
+      <div className="relative">
+        <div className="w-full bg-gray-200 rounded-full h-2.5 overflow-hidden">
+          <div 
+            className="bg-gradient-to-r from-indigo-500 to-purple-600 h-2.5 rounded-full transition-all duration-500 ease-out"
+            style={{ width: `${percentage}%` }}
+          />
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const Badge = ({ icon, label, color = 'gray' }) => {
+  const colorClasses = {
+    primary: 'bg-emerald-100 text-emerald-800 border border-emerald-200',
+    secondary: 'bg-indigo-100 text-indigo-800 border border-indigo-200',
+    warning: 'bg-amber-100 text-amber-800 border border-amber-200',
+    gray: 'bg-gray-100 text-gray-700 border border-gray-200',
+    // Mapeamentos legados
+    green: 'bg-emerald-100 text-emerald-800 border border-emerald-200',
+    blue: 'bg-indigo-100 text-indigo-800 border border-indigo-200',
+    orange: 'bg-amber-100 text-amber-800 border border-amber-200',
+    red: 'bg-amber-100 text-amber-800 border border-amber-200',
+    purple: 'bg-indigo-100 text-indigo-800 border border-indigo-200',
+    cyan: 'bg-indigo-100 text-indigo-800 border border-indigo-200',
+    yellow: 'bg-amber-100 text-amber-800 border border-amber-200'
+  };
+
+  return (
+    <span className={`inline-flex items-center gap-1 px-3 py-1 rounded-lg text-xs font-medium ${colorClasses[color]}`}>
+      {icon && <span>{icon}</span>}
+      <span>{label}</span>
+    </span>
+  );
+};
+
+// ============================================================================
+// ANALYTICS COMPONENTS
+// ============================================================================
+
+const SubjectProgressCard = ({ stats, onClick }) => (
+  <div 
+    onClick={onClick}
+    className="group p-6 bg-white border border-gray-200 rounded-2xl hover:border-emerald-400 hover:shadow-md transition-all cursor-pointer"
+  >
+    <div className="flex items-start justify-between mb-4">
+      <div>
+        <h3 className="text-xl font-bold text-gray-900 mb-1 group-hover:text-emerald-600 transition-colors">
+          {stats.name}
+        </h3>
+        <div className="flex items-center gap-3 text-sm text-gray-600">
+          <span>📚 {stats.totalCards} cartões</span>
+          {stats.streak > 0 && <span className="text-emerald-600 font-semibold">🔥 {stats.streak} dias</span>}
+        </div>
+      </div>
+      {stats.todayFocusMinutes > 0 && (
+        <div className="text-right">
+          <div className="text-xs text-gray-500 mb-1">Hoje</div>
+          <div className="text-lg font-bold text-indigo-600">
+            ⏱️ {Math.floor(stats.todayFocusMinutes / 60) > 0 
+              ? `${Math.floor(stats.todayFocusMinutes / 60)}h ${stats.todayFocusMinutes % 60}min`
+              : `${stats.todayFocusMinutes}min`}
+          </div>
+        </div>
+      )}
+    </div>
+    
+    <div className="space-y-3">
+      <div>
+        <div className="flex justify-between text-sm mb-2">
+          <span className="font-medium text-gray-700">Progresso</span>
+          <span className="text-emerald-600 font-bold">{stats.masteredPercentage}%</span>
+        </div>
+        <div className="w-full bg-gray-200 rounded-full h-2">
+          <div 
+            className="bg-emerald-500 h-2 rounded-full transition-all duration-500"
+            style={{ width: `${stats.masteredPercentage}%` }}
+          />
+        </div>
+      </div>
+      
+      <div className="flex gap-2 flex-wrap">
+        <Badge label={`${stats.masteredCards} dominados`} color="primary" />
+        {stats.overdueCards > 0 && (
+          <Badge label={`${stats.overdueCards} para revisar`} color="warning" />
+        )}
+      </div>
+    </div>
+  </div>
+);
+
+const CriticalCardItem = ({ card, onClick }) => (
+  <div 
+    onClick={onClick}
+    className="p-4 bg-white border-l-4 border-red-500 rounded-xl shadow-sm hover:shadow-md transition-all cursor-pointer"
+  >
+    <div className="flex items-start justify-between gap-3">
+      <div className="flex-1 min-w-0">
+        <p className="font-semibold text-gray-900 mb-2 truncate">
+          {card.question.length > 60 ? card.question.substring(0, 60) + '...' : card.question}
+        </p>
+        <div className="flex flex-wrap gap-2 text-xs">
+          <span className="px-2 py-1 bg-amber-50 text-red-800 rounded-full font-semibold">
+            ❌ {card.wrongCount} {card.wrongCount === 1 ? 'erro' : 'erros'}
+          </span>
+          {card.averageResponseTime && (
+            <span className="px-2 py-1 bg-blue-100 text-blue-800 rounded-full">
+              ⏱️ {Math.round(card.averageResponseTime / 1000)}s
+            </span>
+          )}
+          <span className="px-2 py-1 bg-purple-100 text-purple-800 rounded-full">
+            ⚡ {card.easeFactor.toFixed(1)}
+          </span>
+          <span className="px-2 py-1 bg-gray-100 text-gray-800 rounded-full">
+            📚 {card.subjectName}
+          </span>
+        </div>
+      </div>
+      <div className="flex-shrink-0 text-right">
+        <div className="text-xs text-gray-500">Prioridade</div>
+        <div className="text-xl font-bold text-amber-600">{card.criticalityScore}</div>
+      </div>
+    </div>
+  </div>
+);
+
+const DailyEventItem = ({ event, subjects }) => {
+  const getEventIcon = (type) => {
+    switch(type) {
+      case 'pomodoro_start': return '▶️';
+      case 'pomodoro_end': return '⏱️';
+      case 'session_end': return '📚';
+      case 'cards_created': return '➕';
+      default: return '📌';
+    }
+  };
+  
+  const getEventColor = (type) => {
+    switch(type) {
+      case 'pomodoro_start': return 'text-emerald-600';
+      case 'pomodoro_end': return 'text-amber-600';
+      case 'session_end': return 'text-indigo-600';
+      case 'cards_created': return 'text-purple-600';
+      default: return 'text-gray-600';
+    }
+  };
+  
+  const subjectName = event.subjectId 
+    ? subjects.find(s => s.id === event.subjectId)?.name || ''
+    : '';
+  
+  return (
+    <div className="flex items-start gap-3 p-3 hover:bg-gray-50 rounded-lg transition-colors">
+      <div className="flex-shrink-0 w-14 text-sm text-gray-500 font-medium">
+        {formatEventTime(event.timestamp)}
+      </div>
+      <div className={`flex-shrink-0 text-xl ${getEventColor(event.type)}`}>
+        {getEventIcon(event.type)}
+      </div>
+      <div className="flex-1">
+        <p className="text-gray-900">
+          {event.description}
+          {subjectName && <span className="text-indigo-600 font-semibold"> ({subjectName})</span>}
+        </p>
+      </div>
+    </div>
+  );
+};
+
+const Modal = ({ isOpen, onClose, title, children }) => {
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black bg-opacity-50 backdrop-blur-sm">
+      <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
+        <div className="sticky top-0 bg-white border-b border-gray-100 p-6 flex items-center justify-between rounded-t-2xl">
+          <h2 className="text-2xl font-bold text-gray-900">{title}</h2>
+          <button
+            onClick={onClose}
+            className="text-gray-400 hover:text-gray-600 text-3xl font-light leading-none"
+          >
+            ×
+          </button>
+        </div>
+        <div className="p-6">
+          {children}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ============================================================================
+// MAIN COMPONENT
+// ============================================================================
+
+export default function App() {
+  const [state, dispatch] = useReducer(appReducer, initialState);
+  const timerStarted = useRef(false);
+
+  // UI State
+  const [showNewSubjectModal, setShowNewSubjectModal] = useState(false);
+  const [newSubjectName, setNewSubjectName] = useState('');
+  const [showBulkModal, setShowBulkModal] = useState(false);
+  const [bulkText, setBulkText] = useState('');
+  const [editingCard, setEditingCard] = useState(null);
+  const [editForm, setEditForm] = useState({ question: '', answer: '', tags: '', difficulty: 3 });
+  const [searchQuery, setSearchQuery] = useState('');
+  const [showGoalSettings, setShowGoalSettings] = useState(false);
+  const [tempGoal, setTempGoal] = useState(20);
+
+  // Delete confirmation state
+  const [deleteConfirm, setDeleteConfirm] = useState({
+    isOpen: false,
+    type: null,
+    id: null,
+    name: null
+  });
+
+  // Pomodoro state
+  const [pomodoroState, setPomodoroState] = useState({
+    mode: 'focus', // focus | shortBreak | longBreak
+    timeLeft: 50 * 60, // in seconds
+    isRunning: false,
+    selectedSubject: null,
+    cyclesCompleted: 0,
+    settings: {
+      focusTime: 50,
+      shortBreak: 10,
+      longBreak: 30
+    }
+  });
+  const pomodoroInterval = useRef(null);
+
+  // Questions state
+  const [questionForm, setQuestionForm] = useState({
+    subject: null,
+    total: '',
+    wrong: '',
+    notes: ''
+  });
+  const [questionSearch, setQuestionSearch] = useState('');
+  const [questionSubjectFilter, setQuestionSubjectFilter] = useState('all');
+  const [showErrorModal, setShowErrorModal] = useState(null);
+  const [errorDetails, setErrorDetails] = useState({
+    reason: '',
+    learned: '',
+    prevent: ''
+  });
+
+  // Load data and migrate
+  useEffect(() => {
+    const storedCards = localStorage.getItem('studyCards');
+    const storedSubjects = localStorage.getItem('subjects');
+    const storedGamification = localStorage.getItem('gamificationData');
+    const storedFocusLogs = localStorage.getItem('focusLogs');
+    const storedQuestionLogs = localStorage.getItem('questionLogs');
+    const storedDailyHistory = localStorage.getItem('dailyHistory');
+    
+    let subjects = [];
+    let cards = [];
+    
+    try {
+      if (storedSubjects) {
+        subjects = JSON.parse(storedSubjects);
+      }
+      
+      if (storedCards) {
+        const parsedCards = JSON.parse(storedCards);
+        
+        // Se não há subjects mas há cards, fazer migração
+        if (!storedSubjects && parsedCards.length > 0) {
+          const migrated = migrateOldData(parsedCards);
+          subjects = migrated.subjects;
+          cards = migrated.cards;
+          localStorage.setItem('subjects', JSON.stringify(subjects));
+        } else {
+          cards = parsedCards;
+        }
+      }
+      
+      const gamification = storedGamification ? JSON.parse(storedGamification) : null;
+      const focusLogs = storedFocusLogs ? JSON.parse(storedFocusLogs) : [];
+      const questionLogs = storedQuestionLogs ? JSON.parse(storedQuestionLogs) : [];
+      const dailyHistory = storedDailyHistory ? JSON.parse(storedDailyHistory) : [];
+      
+      dispatch({
+        type: ACTIONS.LOAD_DATA,
+        payload: { subjects, cards, gamification, focusLogs, questionLogs, dailyHistory }
+      });
+    } catch (error) {
+      console.error('Error loading data:', error);
+    }
+  }, []);
+
+  // Save data
+  useEffect(() => {
+    if (state.subjects.length > 0 || state.cards.length > 0) {
+      localStorage.setItem('subjects', JSON.stringify(state.subjects));
+      localStorage.setItem('studyCards', JSON.stringify(state.cards));
+    }
+  }, [state.subjects, state.cards]);
+
+  useEffect(() => {
+    localStorage.setItem('gamificationData', JSON.stringify(state.gamification));
+  }, [state.gamification]);
+
+  // Save productivity data
+  useEffect(() => {
+    localStorage.setItem('focusLogs', JSON.stringify(state.focusLogs));
+  }, [state.focusLogs]);
+
+  useEffect(() => {
+    localStorage.setItem('questionLogs', JSON.stringify(state.questionLogs));
+  }, [state.questionLogs]);
+
+  useEffect(() => {
+    localStorage.setItem('dailyHistory', JSON.stringify(state.dailyHistory));
+  }, [state.dailyHistory]);
+
+  // Timer logic
+  useEffect(() => {
+    if (state.session && !state.session.showAnswer && !timerStarted.current) {
+      dispatch({ type: ACTIONS.START_TIMER });
+      timerStarted.current = true;
+    }
+    if (state.session && state.session.showAnswer) {
+      timerStarted.current = false;
+    }
+    if (!state.session) {
+      timerStarted.current = false;
+    }
+  }, [state.session?.currentIndex, state.session?.showAnswer]);
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    if (!state.session) return;
+
+    const handleKeyPress = (e) => {
+      if (!state.session.showAnswer && e.code === 'Space') {
+        e.preventDefault();
+        dispatch({ type: ACTIONS.SHOW_ANSWER });
+      } else if (state.session.showAnswer) {
+        if (e.code === 'Digit1') {
+          e.preventDefault();
+          dispatch({ type: ACTIONS.GRADE_CARD, payload: 'wrong' });
+        } else if (e.code === 'Digit2') {
+          e.preventDefault();
+          dispatch({ type: ACTIONS.GRADE_CARD, payload: 'good' });
+        } else if (e.code === 'Digit3') {
+          e.preventDefault();
+          dispatch({ type: ACTIONS.GRADE_CARD, payload: 'easy' });
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyPress);
+    return () => window.removeEventListener('keydown', handleKeyPress);
+  }, [state.session]);
+
+  // Pomodoro timer
+  useEffect(() => {
+    if (pomodoroState.isRunning) {
+      pomodoroInterval.current = setInterval(() => {
+        setPomodoroState(prev => {
+          if (prev.timeLeft <= 1) {
+            // Timer completed - return early to avoid side effects in setState
+            return {
+              ...prev,
+              timeLeft: 0,
+              isRunning: false,
+              // Mark that we need to process completion
+              _needsCompletion: true,
+              _completedMode: prev.mode,
+              _completedSubject: prev.selectedSubject,
+              _completedMinutes: prev.settings.focusTime
+            };
+          }
+          return { ...prev, timeLeft: prev.timeLeft - 1 };
+        });
+      }, 1000);
+      
+      return () => clearInterval(pomodoroInterval.current);
+    }
+  }, [pomodoroState.isRunning]);
+
+  // Handle Pomodoro completion separately (clean side effects)
+  useEffect(() => {
+    if (pomodoroState._needsCompletion) {
+      // Clear the completion flag first
+      const completedMode = pomodoroState._completedMode;
+      const completedSubject = pomodoroState._completedSubject;
+      const completedMinutes = pomodoroState._completedMinutes;
+      
+      // Save focus log if it was a focus session
+      if (completedMode === 'focus' && completedSubject) {
+        const log = {
+          id: `focus_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          date: getToday(),
+          subject: completedSubject,
+          minutes: completedMinutes,
+          timestamp: Date.now()
+        };
+        dispatch({ type: ACTIONS.ADD_FOCUS_LOG, payload: log });
+        
+        // Adicionar evento ao histórico diário
+        const pomodoroEvent = createDailyEvent(
+          'pomodoro_end',
+          `Pomodoro de ${completedMinutes}min concluído`,
+          completedSubject
+        );
+        dispatch({ type: ACTIONS.ADD_DAILY_EVENT, payload: pomodoroEvent });
+      }
+      
+      // Calculate next mode and cycles
+      const newCycles = completedMode === 'focus' ? pomodoroState.cyclesCompleted + 1 : pomodoroState.cyclesCompleted;
+      const nextMode = completedMode === 'focus' 
+        ? (newCycles % 4 === 0 ? 'longBreak' : 'shortBreak')
+        : 'focus';
+      
+      const timeMap = {
+        focus: pomodoroState.settings.focusTime * 60,
+        shortBreak: pomodoroState.settings.shortBreak * 60,
+        longBreak: pomodoroState.settings.longBreak * 60
+      };
+      
+      // Update state with new mode and cycles
+      setPomodoroState(prev => ({
+        ...prev,
+        mode: nextMode,
+        timeLeft: timeMap[nextMode],
+        isRunning: false,
+        cyclesCompleted: newCycles,
+        _needsCompletion: false,
+        _completedMode: undefined,
+        _completedSubject: undefined,
+        _completedMinutes: undefined
+      }));
+    }
+  }, [pomodoroState._needsCompletion, pomodoroState._completedMode, pomodoroState._completedSubject, pomodoroState._completedMinutes, pomodoroState.cyclesCompleted, pomodoroState.settings, dispatch]);
+
+  // Helpers
+  const getSubjectStats = (subjectId) => {
+    const subjectCards = state.cards.filter(c => c.subjectId === subjectId);
+    const dueCards = getDueCards(subjectCards);
+    return {
+      total: subjectCards.length,
+      due: dueCards.length
+    };
+  };
+
+  const getCurrentSubject = () => {
+    return state.subjects.find(s => s.id === state.currentSubjectId);
+  };
+
+  const formatTime = (ms) => {
+    if (!ms) return '--';
+    const seconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = seconds % 60;
+    if (minutes > 0) return `${minutes}m ${remainingSeconds}s`;
+    return `${seconds}s`;
+  };
+
+  const formatDuration = (seconds) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  };
+
+  const formatMinutes = (minutes) => {
+    const hours = Math.floor(minutes / 60);
+    const mins = minutes % 60;
+    if (hours > 0) return `${hours}h ${mins}min`;
+    return `${mins}min`;
+  };
+
+  const formatDate = (timestamp) => {
+    return new Date(timestamp).toLocaleDateString('pt-BR', {
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric'
+    });
+  };
+
+  const handleAddSubject = () => {
+    if (!newSubjectName.trim()) return;
+    dispatch({
+      type: ACTIONS.ADD_SUBJECT,
+      payload: { name: newSubjectName, color: 'blue' }
+    });
+    setNewSubjectName('');
+    setShowNewSubjectModal(false);
+  };
+
+  const handleDeleteSubject = (subjectId) => {
+    const subject = state.subjects.find(s => s.id === subjectId);
+    setDeleteConfirm({
+      isOpen: true,
+      type: 'subject',
+      id: subjectId,
+      name: subject?.name || 'esta matéria'
+    });
+  };
+
+  const confirmDelete = () => {
+    if (deleteConfirm.type === 'subject') {
+      dispatch({ type: ACTIONS.DELETE_SUBJECT, payload: deleteConfirm.id });
+    } else if (deleteConfirm.type === 'card') {
+      dispatch({ type: ACTIONS.DELETE_CARD, payload: deleteConfirm.id });
+    } else if (deleteConfirm.type === 'question') {
+      dispatch({ type: ACTIONS.DELETE_QUESTION_LOG, payload: deleteConfirm.id });
+    }
+    setDeleteConfirm({ isOpen: false, type: null, id: null, name: null });
+  };
+
+  const cancelDelete = () => {
+    setDeleteConfirm({ isOpen: false, type: null, id: null, name: null });
+  };
+
+  const handleAddCard = () => {
+    if (!state.form.question.trim() || !state.form.answer.trim()) return;
+    dispatch({
+      type: ACTIONS.ADD_CARD,
+      payload: { ...state.form, subjectId: state.currentSubjectId }
+    });
+  };
+
+  const handleBulkCreate = () => {
+    const cards = parseBulkText(bulkText);
+    if (cards.length === 0) {
+      alert('Formato inválido. Use: Pergunta = Resposta');
+      return;
+    }
+    dispatch({
+      type: ACTIONS.BULK_ADD_CARDS,
+      payload: { cards, subjectId: state.currentSubjectId }
+    });
+    
+    // Adicionar evento de criação
+    const createEvent = createDailyEvent(
+      'cards_created',
+      `${cards.length} ${cards.length === 1 ? 'cartão criado' : 'cartões criados'}`,
+      state.currentSubjectId
+    );
+    dispatch({ type: ACTIONS.ADD_DAILY_EVENT, payload: createEvent });
+    
+    setBulkText('');
+    setShowBulkModal(false);
+  };
+
+  const handleEditCard = (card) => {
+    setEditingCard(card);
+    setEditForm({
+      question: card.question,
+      answer: card.answer,
+      tags: card.tags,
+      difficulty: card.difficulty
+    });
+  };
+
+  const handleSaveEdit = () => {
+    if (!editForm.question.trim() || !editForm.answer.trim()) return;
+    dispatch({
+      type: ACTIONS.UPDATE_CARD,
+      payload: {
+        id: editingCard.id,
+        updates: {
+          question: editForm.question.trim(),
+          answer: editForm.answer.trim(),
+          tags: editForm.tags.trim(),
+          difficulty: parseInt(editForm.difficulty)
+        }
+      }
+    });
+    setEditingCard(null);
+  };
+
+  const handleExport = () => {
+    const data = {
+      subjects: state.subjects,
+      cards: state.cards,
+      gamification: state.gamification,
+      focusLogs: state.focusLogs,
+      questionLogs: state.questionLogs,
+      exportDate: new Date().toISOString(),
+      version: '3.0'
+    };
+    const dataStr = JSON.stringify(data, null, 2);
+    const dataBlob = new Blob([dataStr], { type: 'application/json' });
+    const url = URL.createObjectURL(dataBlob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `active-recall-backup-${new Date().toISOString().split('T')[0]}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // Pomodoro handlers
+  const startPomodoro = () => {
+    if (!pomodoroState.selectedSubject && pomodoroState.mode === 'focus') {
+      alert('Selecione uma matéria para focar!');
+      return;
+    }
+    setPomodoroState(prev => ({ ...prev, isRunning: true }));
+    
+    // Adicionar evento de início de pomodoro
+    if (pomodoroState.mode === 'focus' && pomodoroState.selectedSubject) {
+      const startEvent = createDailyEvent(
+        'pomodoro_start',
+        `Pomodoro iniciado (${pomodoroState.settings.focusTime}min)`,
+        pomodoroState.selectedSubject
+      );
+      dispatch({ type: ACTIONS.ADD_DAILY_EVENT, payload: startEvent });
+    }
+  };
+
+  const pausePomodoro = () => {
+    setPomodoroState(prev => ({ ...prev, isRunning: false }));
+  };
+
+  const resetPomodoro = () => {
+    clearInterval(pomodoroInterval.current);
+    setPomodoroState(prev => ({
+      ...prev,
+      timeLeft: prev.settings[prev.mode === 'focus' ? 'focusTime' : prev.mode === 'shortBreak' ? 'shortBreak' : 'longBreak'] * 60,
+      isRunning: false
+    }));
+  };
+
+  const skipPomodoro = () => {
+    clearInterval(pomodoroInterval.current);
+    const newCycles = pomodoroState.mode === 'focus' ? pomodoroState.cyclesCompleted + 1 : pomodoroState.cyclesCompleted;
+    const nextMode = pomodoroState.mode === 'focus' 
+      ? (newCycles % 4 === 0 ? 'longBreak' : 'shortBreak')
+      : 'focus';
+    
+    const timeMap = {
+      focus: pomodoroState.settings.focusTime * 60,
+      shortBreak: pomodoroState.settings.shortBreak * 60,
+      longBreak: pomodoroState.settings.longBreak * 60
+    };
+    
+    setPomodoroState(prev => ({
+      ...prev,
+      mode: nextMode,
+      timeLeft: timeMap[nextMode],
+      isRunning: false,
+      cyclesCompleted: newCycles
+    }));
+  };
+
+  // Focus stats
+  const todayFocusLogs = state.focusLogs.filter(log => log.date === getToday());
+  const totalFocusToday = todayFocusLogs.reduce((sum, log) => sum + log.minutes, 0);
+  const focusBySubjectToday = todayFocusLogs.reduce((acc, log) => {
+    const subjectName = state.subjects.find(s => s.id === log.subject)?.name || 'Sem matéria';
+    acc[subjectName] = (acc[subjectName] || 0) + log.minutes;
+    return acc;
+  }, {});
+
+  // Question handlers
+  const handleAddQuestion = () => {
+    if (!questionForm.subject || !questionForm.total || !questionForm.wrong) {
+      alert('Preencha matéria, total e erradas!');
+      return;
+    }
+    
+    const total = parseInt(questionForm.total);
+    const wrong = parseInt(questionForm.wrong);
+    
+    if (wrong > total) {
+      alert('Erradas não pode ser maior que o total!');
+      return;
+    }
+    
+    const log = {
+      id: `question_${Date.now()}`,
+      date: getToday(),
+      subject: questionForm.subject,
+      total: total,
+      wrong: wrong,
+      notes: questionForm.notes.trim(),
+      timestamp: Date.now(),
+      errorDetails: null
+    };
+    
+    dispatch({ type: ACTIONS.ADD_QUESTION_LOG, payload: log });
+    setQuestionForm({ subject: null, total: '', wrong: '', notes: '' });
+  };
+
+  const openErrorModal = (log) => {
+    setShowErrorModal(log);
+    setErrorDetails(log.errorDetails || { reason: '', learned: '', prevent: '' });
+  };
+
+  // Question stats
+  const todayQuestionLogs = state.questionLogs.filter(log => log.date === getToday());
+  const totalQuestionsToday = todayQuestionLogs.reduce((sum, log) => sum + log.total, 0);
+  const totalWrongToday = todayQuestionLogs.reduce((sum, log) => sum + log.wrong, 0);
+  const accuracyToday = totalQuestionsToday > 0 
+    ? ((totalQuestionsToday - totalWrongToday) / totalQuestionsToday * 100).toFixed(1)
+    : 0;
+
+  const filteredQuestions = state.questionLogs.filter(log => {
+    const matchesSubject = questionSubjectFilter === 'all' || log.subject === questionSubjectFilter;
+    const matchesSearch = questionSearch === '' ||
+      log.notes.toLowerCase().includes(questionSearch.toLowerCase()) ||
+      state.subjects.find(s => s.id === log.subject)?.name.toLowerCase().includes(questionSearch.toLowerCase());
+    return matchesSubject && matchesSearch;
+  });
+
+  const currentCard = state.session ? state.session.queue[state.session.currentIndex] : null;
+  const currentSubject = getCurrentSubject();
+  const subjectCards = state.currentSubjectId ? state.cards.filter(c => c.subjectId === state.currentSubjectId) : [];
+  const filteredSubjectCards = subjectCards.filter(card =>
+    searchQuery === '' ||
+    card.question.toLowerCase().includes(searchQuery.toLowerCase()) ||
+    card.answer.toLowerCase().includes(searchQuery.toLowerCase()) ||
+    (card.tags && card.tags.toLowerCase().includes(searchQuery.toLowerCase()))
+  );
+  const allDueCards = getDueCards(state.cards);
+  const goalProgress = state.gamification.dailyGoal > 0 
+    ? Math.min(100, (state.gamification.cardsReviewedToday / state.gamification.dailyGoal) * 100) 
+    : 0;
+
+  // Calcular dados de analytics
+  const subjectProgressData = getSubjectProgress(state.cards, state.subjects, state.focusLogs);
+  const criticalCards = getCriticalCards(state.cards, state.subjects);
+  const todayEvents = getTodayEvents(state.dailyHistory);
+
+  return (
+    <div className="min-h-screen bg-[#F9FAFB]">
+      {/* Achievements */}
+      {state.gamification.achievements.length > 0 && (
+        <div className="fixed top-6 right-6 z-50 space-y-3 max-w-sm">
+          {state.gamification.achievements.map(achievement => (
+            <AchievementNotification
+              key={achievement.id}
+              achievement={achievement}
+              onDismiss={() => dispatch({ type: ACTIONS.DISMISS_ACHIEVEMENT, payload: achievement.id })}
+            />
+          ))}
+        </div>
+      )}
+
+      {/* Delete Confirmation Modal */}
+      <Modal
+        isOpen={deleteConfirm.isOpen}
+        onClose={cancelDelete}
+        title="⚠️ Confirmar Exclusão"
+      >
+        <div className="space-y-6">
+          <div className="flex items-start gap-4">
+            <div className="flex-shrink-0 w-12 h-12 bg-amber-50 rounded-full flex items-center justify-center">
+              <span className="text-2xl">🗑️</span>
+            </div>
+            <div className="flex-1">
+              <h3 className="text-lg font-bold text-gray-900 mb-2">
+                Tem certeza que deseja excluir?
+              </h3>
+              <p className="text-gray-600">
+                {deleteConfirm.type === 'subject' && (
+                  <>
+                    Você está prestes a excluir a matéria <strong>"{deleteConfirm.name}"</strong>.
+                    <br />
+                    <span className="text-sm text-amber-700 mt-2 block">
+                      ⚠️ Os cartões desta matéria ficarão sem matéria.
+                    </span>
+                  </>
+                )}
+                {deleteConfirm.type === 'card' && (
+                  <>
+                    O cartão <strong>"{deleteConfirm.name}"</strong> será excluído permanentemente.
+                  </>
+                )}
+                {deleteConfirm.type === 'question' && (
+                  <>
+                    O registro <strong>"{deleteConfirm.name}"</strong> será excluído permanentemente.
+                  </>
+                )}
+              </p>
+            </div>
+          </div>
+          
+          <div className="flex gap-3 pt-4">
+            <button
+              onClick={cancelDelete}
+              className="flex-1 px-6 py-3 bg-gray-200 hover:bg-gray-300 text-gray-800 rounded-xl font-semibold transition-colors"
+            >
+              Cancelar
+            </button>
+            <button
+              onClick={confirmDelete}
+              className="flex-1 px-6 py-3 bg-amber-500 hover:bg-amber-600 text-white rounded-xl font-semibold transition-colors shadow-lg"
+            >
+              Sim, Excluir
+            </button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* New Subject Modal */}
+      <Modal
+        isOpen={showNewSubjectModal}
+        onClose={() => {
+          setShowNewSubjectModal(false);
+          setNewSubjectName('');
+        }}
+        title="Nova Matéria"
+      >
+        <div className="space-y-5">
+          <div>
+            <label className="block text-sm font-semibold text-gray-700 mb-2">
+              Nome da Matéria
+            </label>
+            <input
+              type="text"
+              value={newSubjectName}
+              onChange={(e) => setNewSubjectName(e.target.value)}
+              placeholder="Ex: Matemática, Português, Biologia..."
+              className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+              autoFocus
+              onKeyPress={(e) => e.key === 'Enter' && handleAddSubject()}
+            />
+          </div>
+          <div className="flex gap-3">
+            <button
+              onClick={() => {
+                setShowNewSubjectModal(false);
+                setNewSubjectName('');
+              }}
+              className="flex-1 px-6 py-3 bg-gray-200 hover:bg-gray-300 text-gray-800 rounded-xl font-semibold transition-colors"
+            >
+              Cancelar
+            </button>
+            <button
+              onClick={handleAddSubject}
+              disabled={!newSubjectName.trim()}
+              className="flex-1 px-6 py-3 bg-emerald-500 text-white rounded-xl font-semibold hover:bg-emerald-600 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              Criar Matéria
+            </button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Bulk Create Modal */}
+      <Modal
+        isOpen={showBulkModal}
+        onClose={() => {
+          setShowBulkModal(false);
+          setBulkText('');
+        }}
+        title="Criar Vários Cartões"
+      >
+        <div className="space-y-5">
+          <div>
+            <p className="text-gray-600 mb-4">
+              Cole um cartão por linha usando: <code className="bg-gray-100 px-2 py-1 rounded">Pergunta = Resposta</code>
+            </p>
+            <textarea
+              value={bulkText}
+              onChange={(e) => setBulkText(e.target.value)}
+              placeholder="Paris = França
+Roma = Itália
+Berlim = Alemanha"
+              className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-transparent resize-none font-mono text-sm"
+              rows="10"
+            />
+            {bulkText && (
+              <p className="text-sm text-gray-600 mt-2">
+                {parseBulkText(bulkText).length} cartões serão criados
+              </p>
+            )}
+          </div>
+          <div className="flex gap-3">
+            <button
+              onClick={() => {
+                setShowBulkModal(false);
+                setBulkText('');
+              }}
+              className="flex-1 px-6 py-3 bg-gray-200 hover:bg-gray-300 text-gray-800 rounded-xl font-semibold transition-colors"
+            >
+              Cancelar
+            </button>
+            <button
+              onClick={handleBulkCreate}
+              disabled={parseBulkText(bulkText).length === 0}
+              className="flex-1 px-6 py-3 bg-emerald-500 text-white rounded-xl font-semibold hover:bg-emerald-600 transition-all disabled:opacity-50"
+            >
+              Criar {parseBulkText(bulkText).length} Cartões
+            </button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Edit Card Modal */}
+      <Modal
+        isOpen={editingCard !== null}
+        onClose={() => setEditingCard(null)}
+        title="Editar Cartão"
+      >
+        <div className="space-y-5">
+          <div>
+            <label className="block text-sm font-semibold text-gray-700 mb-2">Pergunta</label>
+            <input
+              type="text"
+              value={editForm.question}
+              onChange={(e) => setEditForm({ ...editForm, question: e.target.value })}
+              className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-semibold text-gray-700 mb-2">Resposta</label>
+            <textarea
+              value={editForm.answer}
+              onChange={(e) => setEditForm({ ...editForm, answer: e.target.value })}
+              className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-transparent resize-none"
+              rows="4"
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-semibold text-gray-700 mb-2">Tags</label>
+              <input
+                type="text"
+                value={editForm.tags}
+                onChange={(e) => setEditForm({ ...editForm, tags: e.target.value })}
+                className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-semibold text-gray-700 mb-2">Dificuldade</label>
+              <select
+                value={editForm.difficulty}
+                onChange={(e) => setEditForm({ ...editForm, difficulty: e.target.value })}
+                className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+              >
+                <option value="1">1 - Muito Fácil</option>
+                <option value="2">2 - Fácil</option>
+                <option value="3">3 - Médio</option>
+                <option value="4">4 - Difícil</option>
+                <option value="5">5 - Muito Difícil</option>
+              </select>
+            </div>
+          </div>
+          <div className="flex gap-3 pt-4">
+            <button
+              onClick={() => setEditingCard(null)}
+              className="flex-1 px-6 py-3 bg-gray-200 hover:bg-gray-300 text-gray-800 rounded-xl font-semibold transition-colors"
+            >
+              Cancelar
+            </button>
+            <button
+              onClick={handleSaveEdit}
+              className="flex-1 px-6 py-3 bg-emerald-500 text-white rounded-xl font-semibold hover:bg-emerald-600 transition-all"
+            >
+              Salvar
+            </button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Error Details Modal */}
+      <Modal
+        isOpen={showErrorModal !== null}
+        onClose={() => {
+          setShowErrorModal(null);
+          setErrorDetails({ reason: '', learned: '', prevent: '' });
+        }}
+        title="📓 Caderno de Erros"
+      >
+        <div className="space-y-5">
+          <div>
+            <label className="block text-sm font-semibold text-gray-700 mb-2">Por que errei?</label>
+            <textarea
+              value={errorDetails.reason}
+              onChange={(e) => setErrorDetails({ ...errorDetails, reason: e.target.value })}
+              placeholder="Ex: Confundi conceitos, falta de atenção, não sabia a fórmula..."
+              className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-red-500 focus:border-transparent resize-none"
+              rows="3"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-semibold text-gray-700 mb-2">O que aprendi?</label>
+            <textarea
+              value={errorDetails.learned}
+              onChange={(e) => setErrorDetails({ ...errorDetails, learned: e.target.value })}
+              placeholder="Ex: A diferença entre X e Y, revisei a teoria..."
+              className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-none"
+              rows="3"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-semibold text-gray-700 mb-2">Como evitar?</label>
+            <textarea
+              value={errorDetails.prevent}
+              onChange={(e) => setErrorDetails({ ...errorDetails, prevent: e.target.value })}
+              placeholder="Ex: Revisar antes do fim de semana, criar flashcard sobre este tema..."
+              className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 focus:border-transparent resize-none"
+              rows="3"
+            />
+          </div>
+          <div className="flex gap-3 pt-4">
+            <button
+              onClick={() => {
+                setShowErrorModal(null);
+                setErrorDetails({ reason: '', learned: '', prevent: '' });
+              }}
+              className="flex-1 px-6 py-3 bg-gray-200 hover:bg-gray-300 text-gray-800 rounded-xl font-semibold transition-colors"
+            >
+              Cancelar
+            </button>
+            <button
+              onClick={() => {
+                if (!showErrorModal) return;
+                dispatch({
+                  type: ACTIONS.UPDATE_QUESTION_LOG,
+                  payload: {
+                    id: showErrorModal.id,
+                    updates: {
+                      errorDetails: {
+                        reason: errorDetails.reason.trim(),
+                        learned: errorDetails.learned.trim(),
+                        prevent: errorDetails.prevent.trim()
+                      }
+                    }
+                  }
+                });
+                setShowErrorModal(null);
+                setErrorDetails({ reason: '', learned: '', prevent: '' });
+              }}
+              className="flex-1 px-6 py-3 bg-gradient-to-r from-red-600 to-pink-600 text-white rounded-xl font-semibold hover:from-red-700 hover:to-pink-700 transition-all"
+            >
+              Salvar
+            </button>
+          </div>
+        </div>
+      </Modal>
+
+      <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        {/* SUBJECTS VIEW - Main Screen */}
+        {state.currentView === 'subjects' && (
+          <div className="space-y-6">
+            {/* Header */}
+            <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-8">
+              <div className="flex items-center justify-between mb-6">
+                <div>
+                  <h1 className="text-4xl font-bold bg-emerald-500 bg-clip-text text-transparent">
+                    Minhas Matérias
+                  </h1>
+                  <p className="text-gray-500 mt-1">Organize seus estudos por matéria</p>
+                </div>
+                <div className="flex gap-3">
+                  <button
+                    onClick={handleExport}
+                    className="px-4 py-2 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-xl font-medium transition-colors"
+                  >
+                    📤 Exportar
+                  </button>
+                  <button
+                    onClick={() => setShowNewSubjectModal(true)}
+                    className="px-6 py-3 bg-emerald-500 text-white rounded-xl font-semibold hover:bg-emerald-600 transition-all shadow-md hover:shadow-lg"
+                  >
+                    ➕ Nova Matéria
+                  </button>
+                </div>
+              </div>
+
+              {/* Gamification Stats */}
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                <div className="bg-gradient-to-br from-orange-50 to-red-50 border border-orange-200 rounded-xl p-5">
+                  <div className="text-3xl mb-2">🔥</div>
+                  <div className="text-xs font-medium text-gray-600 uppercase tracking-wide mb-1">Sequência</div>
+                  <div className="text-2xl font-bold text-amber-600">{state.gamification.currentStreak} dias</div>
+                  <div className="text-xs text-gray-500 mt-1">Recorde: {state.gamification.bestStreak}</div>
+                </div>
+                <div className="bg-gradient-to-br from-green-50 to-emerald-50 border border-green-200 rounded-xl p-5">
+                  <div className="text-3xl mb-2">🎯</div>
+                  <div className="text-xs font-medium text-gray-600 uppercase tracking-wide mb-1">Meta Hoje</div>
+                  <div className="text-2xl font-bold text-emerald-600">{state.gamification.cardsReviewedToday}/{state.gamification.dailyGoal}</div>
+                  <div className="w-full bg-gray-200 rounded-full h-1.5 mt-3">
+                    <div className="bg-emerald-500 h-1.5 rounded-full transition-all duration-500" style={{ width: `${goalProgress}%` }} />
+                  </div>
+                </div>
+                <div className="bg-gradient-to-br from-blue-50 to-cyan-50 border border-blue-200 rounded-xl p-5">
+                  <div className="text-3xl mb-2">📚</div>
+                  <div className="text-xs font-medium text-gray-600 uppercase tracking-wide mb-1">Matérias</div>
+                  <div className="text-2xl font-bold text-blue-600">{state.subjects.length}</div>
+                  <div className="text-xs text-gray-500 mt-1">{state.cards.length} cartões</div>
+                </div>
+                <div className="bg-gradient-to-br from-purple-50 to-pink-50 border border-purple-200 rounded-xl p-5">
+                  <div className="text-3xl mb-2">⏰</div>
+                  <div className="text-xs font-medium text-gray-600 uppercase tracking-wide mb-1">Para Revisar</div>
+                  <div className="text-2xl font-bold text-purple-600">{allDueCards.length}</div>
+                  <div className="text-xs text-gray-500 mt-1">cartões prontos</div>
+                </div>
+              </div>
+
+              {/* Goal Settings */}
+              <div className="mt-6 pt-6 border-t border-gray-100">
+                <button
+                  onClick={() => {
+                    setTempGoal(state.gamification.dailyGoal);
+                    setShowGoalSettings(!showGoalSettings);
+                  }}
+                  className="text-sm text-indigo-600 hover:text-indigo-700 font-medium flex items-center gap-2"
+                >
+                  <span>⚙️</span>
+                  <span>Configurar Meta Diária</span>
+                </button>
+
+                {showGoalSettings && (
+                  <div className="mt-4 p-4 bg-indigo-50 rounded-xl border border-indigo-100">
+                    <label className="block text-sm font-semibold text-gray-700 mb-3">
+                      Quantos cartões você quer revisar por dia?
+                    </label>
+                    <div className="flex gap-3">
+                      <input
+                        type="number"
+                        min="1"
+                        max="100"
+                        value={tempGoal}
+                        onChange={(e) => setTempGoal(parseInt(e.target.value) || 20)}
+                        className="flex-1 px-4 py-2.5 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                      />
+                      <button
+                        onClick={() => {
+                          dispatch({ type: ACTIONS.SET_DAILY_GOAL, payload: tempGoal });
+                          setShowGoalSettings(false);
+                        }}
+                        className="px-6 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-medium rounded-xl transition-colors"
+                      >
+                        Salvar
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Main Actions - Produtividade */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              {allDueCards.length > 0 && (
+                <button
+                  onClick={() => dispatch({ type: ACTIONS.START_GLOBAL_SESSION })}
+                  className="group p-6 bg-gradient-to-br from-indigo-50 to-purple-50 border-2 border-indigo-200 rounded-xl hover:border-indigo-400 hover:shadow-lg transition-all text-left"
+                >
+                  <div className="text-4xl mb-3">🧠</div>
+                  <h3 className="text-xl font-bold text-gray-900 mb-2 group-hover:text-indigo-600 transition-colors">
+                    Revisão
+                  </h3>
+                  <p className="text-sm text-gray-600">
+                    {allDueCards.length} {allDueCards.length === 1 ? 'cartão pronto' : 'cartões prontos'}
+                  </p>
+                </button>
+              )}
+              
+              <button
+                onClick={() => dispatch({ type: ACTIONS.SET_VIEW, payload: 'focus' })}
+                className="group p-6 bg-gradient-to-br from-orange-50 to-red-50 border-2 border-orange-200 rounded-xl hover:border-orange-400 hover:shadow-lg transition-all text-left"
+              >
+                <div className="text-4xl mb-3">🎯</div>
+                <h3 className="text-xl font-bold text-gray-900 mb-2 group-hover:text-amber-600 transition-colors">
+                  Modo Foco
+                </h3>
+                <p className="text-sm text-gray-600">Pomodoro por matéria</p>
+              </button>
+
+              <button
+                onClick={() => dispatch({ type: ACTIONS.SET_VIEW, payload: 'questions' })}
+                className="group p-6 bg-gradient-to-br from-green-50 to-emerald-50 border-2 border-green-200 rounded-xl hover:border-green-400 hover:shadow-lg transition-all text-left"
+              >
+                <div className="text-4xl mb-3">📝</div>
+                <h3 className="text-xl font-bold text-gray-900 mb-2 group-hover:text-emerald-600 transition-colors">
+                  Questões & Erros
+                </h3>
+                <p className="text-sm text-gray-600">Registre e aprenda</p>
+              </button>
+            </div>
+
+            {/* Global Study Button */}
+            {allDueCards.length > 0 && (
+              <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-8 text-center">
+                <div className="inline-flex items-center justify-center w-20 h-20 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-2xl mb-4">
+                  <span className="text-4xl">🌟</span>
+                </div>
+                <h2 className="text-2xl font-bold text-gray-900 mb-2">
+                  Estudar Tudo
+                </h2>
+                <p className="text-gray-600 mb-6">
+                  Revise cartões de <span className="font-bold text-indigo-600">{allDueCards.length}</span> {allDueCards.length === 1 ? 'cartão pronto' : 'cartões prontos'} de todas as matérias
+                </p>
+                <button
+                  onClick={() => dispatch({ type: ACTIONS.START_GLOBAL_SESSION })}
+                  className="px-8 py-4 bg-emerald-500 text-white rounded-xl font-semibold text-lg hover:bg-emerald-600 transition-all shadow-lg hover:shadow-xl"
+                >
+                  📚 Começar Sessão Global
+                </button>
+              </div>
+            )}
+
+            {/* ==================== SEÇÃO 1: PROGRESSO POR MATÉRIA ==================== */}
+            {state.subjects.length > 0 && (
+              <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-8">
+                <h2 className="text-2xl font-bold text-gray-900 mb-6">📊 Progresso por Matéria</h2>
+                
+                {Object.keys(subjectProgressData).length === 0 ? (
+                  <div className="text-center py-8 text-gray-500">
+                    <p>Nenhuma estatística disponível ainda.</p>
+                    <p className="text-sm mt-2">Comece a estudar para ver seu progresso!</p>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                    {Object.entries(subjectProgressData).map(([subjectId, stats]) => (
+                      <SubjectProgressCard
+                        key={subjectId}
+                        stats={stats}
+                        onClick={() => dispatch({ type: ACTIONS.SET_CURRENT_SUBJECT, payload: subjectId })}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* ==================== SEÇÃO 2: CARTÕES CRÍTICOS ==================== */}
+            {criticalCards.length > 0 && (
+              <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-8">
+                <div className="flex items-center justify-between mb-6">
+                  <div>
+                    <h2 className="text-2xl font-bold text-gray-900">⚠️ Cartões Críticos</h2>
+                    <p className="text-sm text-gray-500 mt-1">Foque nestes cartões para melhorar</p>
+                  </div>
+                  <Badge label={`${criticalCards.length} cartões`} color="red" />
+                </div>
+                
+                <div className="space-y-3">
+                  {criticalCards.map((card) => (
+                    <CriticalCardItem
+                      key={card.id}
+                      card={card}
+                      onClick={() => {
+                        const fullCard = state.cards.find(c => c.id === card.id);
+                        if (fullCard) {
+                          dispatch({ type: ACTIONS.SET_CURRENT_SUBJECT, payload: fullCard.subjectId });
+                        }
+                      }}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* ==================== SEÇÃO 3: HISTÓRICO DIÁRIO ==================== */}
+            <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-8">
+              <h2 className="text-2xl font-bold text-gray-900 mb-6">📅 Seu Dia de Estudos</h2>
+              
+              {todayEvents.length === 0 ? (
+                <div className="text-center py-12">
+                  <div className="text-6xl mb-4">📅</div>
+                  <p className="text-xl text-gray-600 mb-2">Nenhuma atividade hoje</p>
+                  <p className="text-gray-500">Comece a estudar para registrar seu progresso!</p>
+                </div>
+              ) : (
+                <div className="space-y-1">
+                  {todayEvents.map(event => (
+                    <DailyEventItem
+                      key={event.id}
+                      event={event}
+                      subjects={state.subjects}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Subjects List */}
+            <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-8">
+              <h2 className="text-2xl font-bold text-gray-900 mb-6">Suas Matérias</h2>
+              
+              {state.subjects.length === 0 ? (
+                <div className="text-center py-16">
+                  <div className="text-6xl mb-4">📚</div>
+                  <p className="text-xl text-gray-600 mb-2">Nenhuma matéria ainda</p>
+                  <p className="text-gray-500 mb-6">Crie sua primeira matéria para começar a estudar!</p>
+                  <button
+                    onClick={() => setShowNewSubjectModal(true)}
+                    className="px-8 py-4 bg-emerald-500 text-white rounded-xl font-semibold text-lg hover:bg-emerald-600 transition-all shadow-lg"
+                  >
+                    ➕ Criar Primeira Matéria
+                  </button>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {state.subjects.map(subject => {
+                    const stats = getSubjectStats(subject.id);
+                    return (
+                      <div
+                        key={subject.id}
+                        className="group p-6 bg-gradient-to-br from-indigo-50 to-purple-50 border-2 border-indigo-200 rounded-xl hover:border-indigo-400 hover:shadow-lg transition-all"
+                      >
+                        <div className="flex items-start justify-between mb-4">
+                          <div className="text-4xl">📖</div>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              e.preventDefault();
+                              handleDeleteSubject(subject.id);
+                            }}
+                            aria-label={`Excluir matéria ${subject.name}`}
+                            className="text-gray-400 hover:text-red-500 transition-colors text-xl relative z-10 cursor-pointer pointer-events-auto"
+                          >
+                            🗑️
+                          </button>
+                        </div>
+                        <button
+                          onClick={() => dispatch({ type: ACTIONS.SET_CURRENT_SUBJECT, payload: subject.id })}
+                          className="w-full text-left"
+                        >
+                          <h3 className="text-xl font-bold text-gray-900 mb-2 group-hover:text-indigo-600 transition-colors">
+                            {subject.name}
+                          </h3>
+                          <p className="text-sm text-gray-600 mb-2">
+                            {stats.total} {stats.total === 1 ? 'cartão' : 'cartões'}
+                          </p>
+                          {stats.due > 0 && (
+                            <Badge label={`${stats.due} para revisar`} color="orange" />
+                          )}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* SUBJECT DETAIL VIEW */}
+        {state.currentView === 'subject-detail' && currentSubject && (
+          <div className="space-y-6">
+            {/* Header */}
+            <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-8">
+              <button
+                onClick={() => dispatch({ type: ACTIONS.SET_CURRENT_SUBJECT, payload: null })}
+                className="mb-4 text-indigo-600 hover:text-indigo-700 font-medium flex items-center gap-2"
+              >
+                ← Voltar para Minhas Matérias
+              </button>
+              
+              <div className="flex items-center justify-between mb-6">
+                <div>
+                  <h1 className="text-4xl font-bold text-gray-900 mb-2">
+                    📖 {currentSubject.name}
+                  </h1>
+                  <p className="text-gray-500">
+                    {subjectCards.length} {subjectCards.length === 1 ? 'cartão' : 'cartões'} • {getDueCards(subjectCards).length} para revisar
+                  </p>
+                </div>
+                <div className="flex gap-3">
+                  <button
+                    onClick={() => setShowBulkModal(true)}
+                    className="px-4 py-2 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-xl font-medium transition-colors"
+                  >
+                    📋 Em Massa
+                  </button>
+                  {getDueCards(subjectCards).length > 0 && (
+                    <button
+                      onClick={() => dispatch({ type: ACTIONS.START_SESSION, payload: currentSubject.id })}
+                      className="px-6 py-3 bg-emerald-500 text-white rounded-xl font-semibold hover:bg-emerald-600 transition-all shadow-md hover:shadow-lg"
+                    >
+                      ▶️ Estudar ({getDueCards(subjectCards).length})
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Create Card Form */}
+            <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-8">
+              <h2 className="text-2xl font-bold text-gray-900 mb-6">➕ Novo Cartão</h2>
+              <div className="space-y-5">
+                <div>
+                  <label className="block text-sm font-semibold text-gray-700 mb-2">Pergunta *</label>
+                  <input
+                    type="text"
+                    value={state.form.question}
+                    onChange={(e) => dispatch({ type: ACTIONS.SET_FORM, payload: { field: 'question', value: e.target.value } })}
+                    className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                    placeholder="Digite sua pergunta..."
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-semibold text-gray-700 mb-2">Resposta *</label>
+                  <textarea
+                    value={state.form.answer}
+                    onChange={(e) => dispatch({ type: ACTIONS.SET_FORM, payload: { field: 'answer', value: e.target.value } })}
+                    className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-transparent resize-none"
+                    placeholder="Digite a resposta..."
+                    rows="4"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-semibold text-gray-700 mb-2">Tags (opcional)</label>
+                    <input
+                      type="text"
+                      value={state.form.tags}
+                      onChange={(e) => dispatch({ type: ACTIONS.SET_FORM, payload: { field: 'tags', value: e.target.value } })}
+                      className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                      placeholder="ex: fórmulas, conceitos"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-semibold text-gray-700 mb-2">Dificuldade</label>
+                    <select
+                      value={state.form.difficulty}
+                      onChange={(e) => dispatch({ type: ACTIONS.SET_FORM, payload: { field: 'difficulty', value: e.target.value } })}
+                      className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                    >
+                      <option value="1">1 - Muito Fácil</option>
+                      <option value="2">2 - Fácil</option>
+                      <option value="3">3 - Médio</option>
+                      <option value="4">4 - Difícil</option>
+                      <option value="5">5 - Muito Difícil</option>
+                    </select>
+                  </div>
+                </div>
+                <button
+                  onClick={handleAddCard}
+                  disabled={!state.form.question.trim() || !state.form.answer.trim()}
+                  className="w-full py-4 bg-emerald-500 text-white rounded-xl font-semibold text-lg hover:bg-emerald-600 transition-all shadow-md hover:shadow-lg disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  Criar Cartão
+                </button>
+              </div>
+            </div>
+
+            {/* Cards List */}
+            <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-8">
+              <div className="flex items-center justify-between mb-6">
+                <h2 className="text-2xl font-bold text-gray-900">
+                  Cartões ({filteredSubjectCards.length})
+                </h2>
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="🔍 Buscar..."
+                  className="px-4 py-2 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                />
+              </div>
+              
+              {filteredSubjectCards.length === 0 ? (
+                <div className="text-center py-16">
+                  <div className="text-6xl mb-4">📝</div>
+                  <p className="text-xl text-gray-600 mb-2">
+                    {subjectCards.length === 0 ? 'Nenhum cartão ainda' : 'Nenhum cartão encontrado'}
+                  </p>
+                  <p className="text-gray-500">
+                    {subjectCards.length === 0 
+                      ? 'Crie seu primeiro cartão acima!'
+                      : 'Tente ajustar a busca'}
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {filteredSubjectCards.map(card => {
+                    const isDue = card.nextReview <= Date.now();
+                    return (
+                      <div
+                        key={card.id}
+                        className={`border rounded-xl p-5 transition-all hover:shadow-md ${
+                          isDue ? 'border-emerald-300 bg-emerald-50' : 'border-gray-200 bg-white'
+                        }`}
+                      >
+                        <div className="flex gap-4">
+                          <div className="flex-1 min-w-0">
+                            <p className="font-semibold text-gray-900 mb-3 text-lg">
+                              {card.question.length > 100 ? card.question.substring(0, 100) + '...' : card.question}
+                            </p>
+                            <div className="flex flex-wrap gap-2 mb-3">
+                              {card.tags && <Badge label={card.tags} color="blue" />}
+                              <Badge label={`Nível ${card.difficulty}`} color="purple" />
+                              <Badge icon="🔥" label={card.correctStreak.toString()} color="orange" />
+                              <Badge icon="📊" label={`${card.totalReviews} revisões`} color="gray" />
+                            </div>
+                            <div className="text-sm">
+                              <span className={`font-medium ${isDue ? 'text-emerald-700' : 'text-gray-600'}`}>
+                                {isDue ? '✓ Pronto para revisar' : `Próxima: ${formatDate(card.nextReview)}`}
+                              </span>
+                            </div>
+                          </div>
+                          <div className="flex flex-col gap-2">
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleEditCard(card);
+                              }}
+                              className="px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-xl font-medium transition-colors"
+                            >
+                              ✏️
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                e.preventDefault();
+                                setDeleteConfirm({
+                                  isOpen: true,
+                                  type: 'card',
+                                  id: card.id,
+                                  name: card.question.substring(0, 50) + '...'
+                                });
+                              }}
+                              aria-label="Excluir cartão"
+                              className="px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-xl font-medium transition-colors cursor-pointer"
+                            >
+                              🗑️
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* POMODORO VIEW - Modo Foco */}
+        {state.currentView === 'focus' && (
+          <div className="space-y-6">
+            <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-8">
+              <button
+                onClick={() => dispatch({ type: ACTIONS.SET_VIEW, payload: 'subjects' })}
+                className="mb-4 text-indigo-600 hover:text-indigo-700 font-medium flex items-center gap-2"
+              >
+                ← Voltar
+              </button>
+              
+              <h1 className="text-4xl font-bold text-gray-900 mb-2">
+                🎯 Modo Foco (Pomodoro)
+              </h1>
+              <p className="text-gray-500">Concentre-se por matéria e registre seu tempo</p>
+            </div>
+
+            {/* Timer */}
+            <div className="bg-white rounded-2xl shadow-lg border border-gray-100 p-12 text-center">
+              <div className="mb-8">
+                <div className={`text-8xl font-bold ${
+                  pomodoroState.mode === 'focus' ? 'text-amber-600' : 
+                  pomodoroState.mode === 'shortBreak' ? 'text-emerald-600' : 
+                  'text-blue-600'
+                }`}>
+                  {formatDuration(pomodoroState.timeLeft)}
+                </div>
+                <div className="mt-4 text-xl font-semibold text-gray-700">
+                  {pomodoroState.mode === 'focus' && '🔴 Foco'}
+                  {pomodoroState.mode === 'shortBreak' && '🟢 Pausa Curta'}
+                  {pomodoroState.mode === 'longBreak' && '🔵 Pausa Longa'}
+                </div>
+                {pomodoroState.mode === 'focus' && pomodoroState.selectedSubject && (
+                  <div className="mt-2 text-gray-600">
+                    📖 {state.subjects.find(s => s.id === pomodoroState.selectedSubject)?.name}
+                  </div>
+                )}
+              </div>
+
+              {pomodoroState.mode === 'focus' && !pomodoroState.selectedSubject && !pomodoroState.isRunning && (
+                <div className="mb-6">
+                  <label className="block text-sm font-semibold text-gray-700 mb-3">
+                    Selecione a matéria para focar:
+                  </label>
+                  <select
+                    value={pomodoroState.selectedSubject || ''}
+                    onChange={(e) => setPomodoroState(prev => ({ ...prev, selectedSubject: e.target.value }))}
+                    className="w-full max-w-md mx-auto px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500"
+                  >
+                    <option value="">Escolha uma matéria...</option>
+                    {state.subjects.map(subject => (
+                      <option key={subject.id} value={subject.id}>{subject.name}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
+              <div className="flex gap-3 justify-center mb-8">
+                {!pomodoroState.isRunning ? (
+                  <button
+                    onClick={startPomodoro}
+                    className="px-8 py-4 bg-gradient-to-r from-green-600 to-emerald-600 text-white rounded-xl font-semibold text-lg hover:from-green-700 hover:to-emerald-700 transition-all shadow-lg"
+                  >
+                    ▶️ Iniciar
+                  </button>
+                ) : (
+                  <button
+                    onClick={pausePomodoro}
+                    className="px-8 py-4 bg-gradient-to-r from-yellow-600 to-orange-600 text-white rounded-xl font-semibold text-lg hover:from-yellow-700 hover:to-orange-700 transition-all shadow-lg"
+                  >
+                    ⏸️ Pausar
+                  </button>
+                )}
+                
+                <button
+                  onClick={resetPomodoro}
+                  className="px-8 py-4 bg-gray-200 hover:bg-gray-300 text-gray-800 rounded-xl font-semibold text-lg transition-all"
+                >
+                  🔄 Resetar
+                </button>
+                
+                <button
+                  onClick={skipPomodoro}
+                  className="px-8 py-4 bg-gray-200 hover:bg-gray-300 text-gray-800 rounded-xl font-semibold text-lg transition-all"
+                >
+                  ⏭️ Pular
+                </button>
+              </div>
+
+              <div className="text-gray-600">
+                <p>Ciclos concluídos hoje: <strong>{pomodoroState.cyclesCompleted}</strong></p>
+              </div>
+            </div>
+
+            {/* Settings */}
+            <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-8">
+              <h2 className="text-2xl font-bold text-gray-900 mb-6">⚙️ Configurações</h2>
+              <div className="grid grid-cols-3 gap-4">
+                <div>
+                  <label className="block text-sm font-semibold text-gray-700 mb-2">Foco (minutos)</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="120"
+                    value={pomodoroState.settings.focusTime}
+                    onChange={(e) => setPomodoroState(prev => ({
+                      ...prev,
+                      settings: { ...prev.settings, focusTime: parseInt(e.target.value) || 50 }
+                    }))}
+                    className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-semibold text-gray-700 mb-2">Pausa Curta (min)</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="30"
+                    value={pomodoroState.settings.shortBreak}
+                    onChange={(e) => setPomodoroState(prev => ({
+                      ...prev,
+                      settings: { ...prev.settings, shortBreak: parseInt(e.target.value) || 10 }
+                    }))}
+                    className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-semibold text-gray-700 mb-2">Pausa Longa (min)</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="60"
+                    value={pomodoroState.settings.longBreak}
+                    onChange={(e) => setPomodoroState(prev => ({
+                      ...prev,
+                      settings: { ...prev.settings, longBreak: parseInt(e.target.value) || 30 }
+                    }))}
+                    className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* Focus Stats */}
+            <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-8">
+              <h2 className="text-2xl font-bold text-gray-900 mb-6">📊 Estatísticas de Foco</h2>
+              
+              <div className="grid grid-cols-2 gap-6 mb-8">
+                <div className="p-6 bg-gradient-to-br from-orange-50 to-red-50 border border-orange-200 rounded-xl">
+                  <div className="text-3xl mb-2">⏱️</div>
+                  <div className="text-sm font-medium text-gray-600 uppercase tracking-wide mb-1">Hoje</div>
+                  <div className="text-3xl font-bold text-amber-600">{formatMinutes(totalFocusToday)}</div>
+                </div>
+                <div className="p-6 bg-gradient-to-br from-blue-50 to-cyan-50 border border-blue-200 rounded-xl">
+                  <div className="text-3xl mb-2">📚</div>
+                  <div className="text-sm font-medium text-gray-600 uppercase tracking-wide mb-1">Sessões Hoje</div>
+                  <div className="text-3xl font-bold text-blue-600">{todayFocusLogs.length}</div>
+                </div>
+              </div>
+
+              {Object.keys(focusBySubjectToday).length > 0 && (
+                <div>
+                  <h3 className="text-lg font-bold text-gray-900 mb-4">Por Matéria (Hoje)</h3>
+                  <div className="space-y-3">
+                    {Object.entries(focusBySubjectToday)
+                      .sort((a, b) => b[1] - a[1])
+                      .map(([subject, minutes]) => (
+                        <div key={subject} className="flex items-center justify-between p-4 bg-gray-50 rounded-xl">
+                          <span className="font-medium text-gray-900">📖 {subject}</span>
+                          <span className="text-lg font-bold text-indigo-600">{formatMinutes(minutes)}</span>
+                        </div>
+                      ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* QUESTIONS VIEW - Questões & Caderno de Erros */}
+        {state.currentView === 'questions' && (
+          <div className="space-y-6">
+            <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-8">
+              <button
+                onClick={() => dispatch({ type: ACTIONS.SET_VIEW, payload: 'subjects' })}
+                className="mb-4 text-indigo-600 hover:text-indigo-700 font-medium flex items-center gap-2"
+              >
+                ← Voltar
+              </button>
+              
+              <h1 className="text-4xl font-bold text-gray-900 mb-2">
+                📝 Questões & Caderno de Erros
+              </h1>
+              <p className="text-gray-500">Registre suas práticas e aprenda com os erros</p>
+            </div>
+
+            {/* Stats */}
+            <div className="grid grid-cols-3 gap-4">
+              <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
+                <div className="text-3xl mb-2">✅</div>
+                <div className="text-sm font-medium text-gray-600 uppercase tracking-wide mb-1">Hoje</div>
+                <div className="text-3xl font-bold text-emerald-600">{totalQuestionsToday}</div>
+                <div className="text-xs text-gray-500 mt-1">questões</div>
+              </div>
+              <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
+                <div className="text-3xl mb-2">❌</div>
+                <div className="text-sm font-medium text-gray-600 uppercase tracking-wide mb-1">Erradas Hoje</div>
+                <div className="text-3xl font-bold text-amber-600">{totalWrongToday}</div>
+                <div className="text-xs text-gray-500 mt-1">para revisar</div>
+              </div>
+              <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
+                <div className="text-3xl mb-2">📊</div>
+                <div className="text-sm font-medium text-gray-600 uppercase tracking-wide mb-1">Acerto Hoje</div>
+                <div className="text-3xl font-bold text-blue-600">{accuracyToday}%</div>
+                <div className="text-xs text-gray-500 mt-1">taxa de sucesso</div>
+              </div>
+            </div>
+
+            {/* Register Form */}
+            <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-8">
+              <h2 className="text-2xl font-bold text-gray-900 mb-6">➕ Registrar Sessão</h2>
+              <div className="space-y-5">
+                <div>
+                  <label className="block text-sm font-semibold text-gray-700 mb-2">Matéria *</label>
+                  <select
+                    value={questionForm.subject || ''}
+                    onChange={(e) => setQuestionForm({ ...questionForm, subject: e.target.value })}
+                    className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500"
+                  >
+                    <option value="">Selecione uma matéria...</option>
+                    {state.subjects.map(subject => (
+                      <option key={subject.id} value={subject.id}>{subject.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-semibold text-gray-700 mb-2">Total de Questões *</label>
+                    <input
+                      type="number"
+                      min="1"
+                      value={questionForm.total}
+                      onChange={(e) => setQuestionForm({ ...questionForm, total: e.target.value })}
+                      className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500"
+                      placeholder="Ex: 20"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-semibold text-gray-700 mb-2">Questões Erradas *</label>
+                    <input
+                      type="number"
+                      min="0"
+                      value={questionForm.wrong}
+                      onChange={(e) => setQuestionForm({ ...questionForm, wrong: e.target.value })}
+                      className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500"
+                      placeholder="Ex: 3"
+                    />
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-sm font-semibold text-gray-700 mb-2">Observações (opcional)</label>
+                  <textarea
+                    value={questionForm.notes}
+                    onChange={(e) => setQuestionForm({ ...questionForm, notes: e.target.value })}
+                    className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 resize-none"
+                    rows="3"
+                    placeholder="Ex: Dificuldade em interpretação de texto..."
+                  />
+                </div>
+                <button
+                  onClick={handleAddQuestion}
+                  className="w-full py-4 bg-gradient-to-r from-green-600 to-emerald-600 text-white rounded-xl font-semibold text-lg hover:from-green-700 hover:to-emerald-700 transition-all shadow-md hover:shadow-lg"
+                >
+                  Registrar Sessão
+                </button>
+              </div>
+            </div>
+
+            {/* Logs List */}
+            <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-8">
+              <div className="flex items-center justify-between mb-6">
+                <h2 className="text-2xl font-bold text-gray-900">Histórico</h2>
+                <div className="flex gap-3">
+                  <select
+                    value={questionSubjectFilter}
+                    onChange={(e) => setQuestionSubjectFilter(e.target.value)}
+                    className="px-4 py-2 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500"
+                  >
+                    <option value="all">Todas as matérias</option>
+                    {state.subjects.map(subject => (
+                      <option key={subject.id} value={subject.id}>{subject.name}</option>
+                    ))}
+                  </select>
+                  <input
+                    type="text"
+                    value={questionSearch}
+                    onChange={(e) => setQuestionSearch(e.target.value)}
+                    placeholder="🔍 Buscar..."
+                    className="px-4 py-2 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500"
+                  />
+                </div>
+              </div>
+
+              {filteredQuestions.length === 0 ? (
+                <div className="text-center py-16">
+                  <div className="text-6xl mb-4">📝</div>
+                  <p className="text-xl text-gray-600 mb-2">Nenhuma sessão registrada</p>
+                  <p className="text-gray-500">Registre sua primeira prática acima!</p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {filteredQuestions
+                    .sort((a, b) => b.timestamp - a.timestamp)
+                    .map(log => {
+                      const subject = state.subjects.find(s => s.id === log.subject);
+                      const accuracy = ((log.total - log.wrong) / log.total * 100).toFixed(1);
+                      return (
+                        <div
+                          key={log.id}
+                          className="border border-gray-200 rounded-xl p-5 hover:shadow-md transition-all"
+                        >
+                          <div className="flex items-start justify-between mb-3">
+                            <div className="flex-1">
+                              <div className="flex items-center gap-3 mb-2">
+                                <h3 className="text-lg font-bold text-gray-900">
+                                  📖 {subject?.name || 'Sem matéria'}
+                                </h3>
+                                <Badge 
+                                  label={`${accuracy}% acerto`} 
+                                  color={accuracy >= 70 ? 'green' : accuracy >= 50 ? 'yellow' : 'red'} 
+                                />
+                              </div>
+                              <div className="flex items-center gap-4 text-sm text-gray-600">
+                                <span>✅ {log.total} questões</span>
+                                <span>❌ {log.wrong} erradas</span>
+                                <span>📅 {formatDate(log.timestamp)}</span>
+                              </div>
+                              {log.notes && (
+                                <p className="text-sm text-gray-700 mt-3 italic">"{log.notes}"</p>
+                              )}
+                              {log.errorDetails && (
+                                <div className="mt-3 p-3 bg-amber-50 rounded-lg border border-amber-200">
+                                  <p className="text-xs font-semibold text-amber-800 mb-1">📓 Caderno de Erros registrado</p>
+                                  <p className="text-xs text-amber-700">Clique para ver detalhes</p>
+                                </div>
+                              )}
+                            </div>
+                            <div className="flex flex-col gap-2">
+                              {log.wrong > 0 && (
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    openErrorModal(log);
+                                  }}
+                                  className="px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-xl font-medium transition-colors text-sm"
+                                >
+                                  📓 {log.errorDetails ? 'Ver' : 'Erro'}
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  e.preventDefault();
+                                  const subjectName = state.subjects.find(s => s.id === log.subject)?.name || 'Sem matéria';
+                                  setDeleteConfirm({
+                                    isOpen: true,
+                                    type: 'question',
+                                    id: log.id,
+                                    name: `${log.total} questões - ${subjectName}`
+                                  });
+                                }}
+                                aria-label="Excluir registro de questões"
+                                className="px-4 py-2 bg-gray-500 hover:bg-gray-600 text-white rounded-xl font-medium transition-colors text-sm cursor-pointer"
+                              >
+                                🗑️
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* STUDY VIEW */}
+        {state.currentView === 'study' && state.session && currentCard && (
+          <div className="space-y-6">
+            {/* Session Header */}
+            <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-2xl font-bold text-gray-900">
+                  {state.session.subjectId ? `📖 ${state.subjects.find(s => s.id === state.session.subjectId)?.name}` : '🌟 Sessão Global'}
+                </h2>
+                <button
+                  onClick={() => dispatch({ type: ACTIONS.END_SESSION })}
+                  className="px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-xl font-medium transition-colors"
+                >
+                  Encerrar
+                </button>
+              </div>
+
+              <ProgressBar 
+                current={state.session.currentIndex + 1}
+                total={state.session.queue.length}
+              />
+
+              {state.gamification.dailyGoal > 0 && (
+                <div className="mt-4 p-3 bg-green-50 rounded-xl border border-green-200">
+                  <div className="flex items-center justify-between text-sm mb-2">
+                    <span className="font-semibold text-green-800">🎯 Meta Diária</span>
+                    <span className="text-green-700">
+                      {state.gamification.cardsReviewedToday + state.session.cardsCompletedThisSession} / {state.gamification.dailyGoal}
+                    </span>
+                  </div>
+                  <div className="w-full bg-green-200 rounded-full h-1.5">
+                    <div 
+                      className="bg-emerald-500 h-1.5 rounded-full transition-all duration-500"
+                      style={{ 
+                        width: `${Math.min(100, ((state.gamification.cardsReviewedToday + state.session.cardsCompletedThisSession) / state.gamification.dailyGoal) * 100)}%`
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* False Fluency Warning */}
+            {state.session.falseFluencyWarning && (
+              <div className="bg-amber-50 border-l-4 border-amber-500 rounded-xl p-4 shadow-sm">
+                <div className="flex items-start gap-3">
+                  <div className="flex-shrink-0 text-2xl">⚠️</div>
+                  <div className="flex-1">
+                    <p className="font-semibold text-amber-900 mb-1">Ilusão de fluência detectada!</p>
+                    <p className="text-sm text-amber-800">
+                      Você levou {formatTime(state.session.falseFluencyWarning.responseTime)} para responder.
+                      {state.session.falseFluencyWarning.adjustedGrade !== state.session.falseFluencyWarning.grade && (
+                        <span className="block mt-1 font-medium">
+                          ✓ Grade ajustado automaticamente para "Bom"
+                        </span>
+                      )}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => dispatch({ type: ACTIONS.DISMISS_FLUENCY_WARNING })}
+                    className="text-amber-600 hover:text-amber-800 text-xl font-light"
+                  >
+                    ×
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Flashcard */}
+            <div className="bg-white rounded-2xl shadow-lg border border-gray-100 p-8">
+              <div className="flex flex-wrap gap-2 mb-6">
+                <Badge icon="🔥" label={`${currentCard.correctStreak} streak`} color="blue" />
+                <Badge icon="📊" label={`${currentCard.totalReviews} revisões`} color="purple" />
+                {currentCard.averageResponseTime && (
+                  <Badge icon="⏱️" label={formatTime(currentCard.averageResponseTime)} color="cyan" />
+                )}
+              </div>
+
+              <div className="mb-8">
+                <div className="text-sm font-semibold text-gray-500 uppercase tracking-wide mb-3">Pergunta</div>
+                <div className="text-2xl text-gray-900 leading-relaxed">
+                  {currentCard.question}
+                </div>
+              </div>
+
+              {!state.session.showAnswer ? (
+                <div>
+                  <button
+                    onClick={() => dispatch({ type: ACTIONS.SHOW_ANSWER })}
+                    className="w-full py-4 bg-emerald-500 text-white rounded-xl font-semibold text-lg hover:bg-emerald-600 transition-all shadow-md hover:shadow-lg"
+                  >
+                    Mostrar Resposta
+                  </button>
+                  <p className="text-center text-sm text-gray-500 mt-3">
+                    ou pressione <kbd className="px-2 py-1 bg-gray-100 rounded border border-gray-300 text-xs">Espaço</kbd>
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-6">
+                  {state.session.currentResponseTime && (
+                    <div className="p-4 bg-blue-50 rounded-xl border border-blue-200">
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-medium text-blue-900">⏱️ Tempo de resposta</span>
+                        <span className="text-lg font-bold text-blue-600">
+                          {formatTime(state.session.currentResponseTime)}
+                        </span>
+                      </div>
+                    </div>
+                  )}
+
+                  <div>
+                    <div className="text-sm font-semibold text-gray-500 uppercase tracking-wide mb-3">Resposta</div>
+                    <div className="p-6 bg-emerald-50 rounded-xl border-l-4 border-emerald-500 text-lg text-gray-900 leading-relaxed whitespace-pre-wrap">
+                      {currentCard.answer}
+                    </div>
+                  </div>
+
+                  <div>
+                    <p className="text-center text-gray-600 font-medium mb-4">Como você se saiu?</p>
+                    <div className="grid grid-cols-3 gap-3">
+                      <button
+                        onClick={() => dispatch({ type: ACTIONS.GRADE_CARD, payload: 'wrong' })}
+                        className="p-4 bg-amber-500 hover:bg-amber-600 text-white rounded-xl font-semibold transition-all transform hover:scale-105"
+                      >
+                        <div className="text-base">Errei</div>
+                        <div className="text-xs opacity-90 mt-1">Revisar logo</div>
+                      </button>
+                      <button
+                        onClick={() => dispatch({ type: ACTIONS.GRADE_CARD, payload: 'good' })}
+                        className="p-4 bg-amber-500 hover:bg-amber-600 text-white rounded-xl font-semibold transition-all transform hover:scale-105"
+                      >
+                        <div className="text-base">Bom</div>
+                        <div className="text-xs opacity-90 mt-1">
+                          {Math.ceil(currentCard.interval * currentCard.easeFactor)}d
+                        </div>
+                      </button>
+                      <button
+                        onClick={() => dispatch({ type: ACTIONS.GRADE_CARD, payload: 'easy' })}
+                        className="p-4 bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl font-semibold transition-all transform hover:scale-105"
+                      >
+                        <div className="text-base">Fácil</div>
+                        <div className="text-xs opacity-90 mt-1">
+                          {Math.ceil(currentCard.interval * currentCard.easeFactor * 1.3)}d
+                        </div>
+                      </button>
+                    </div>
+                    <p className="text-center text-sm text-gray-500 mt-3">
+                      ou use <kbd className="px-2 py-1 bg-gray-100 rounded border border-gray-300 text-xs">1</kbd>
+                      <kbd className="px-2 py-1 bg-gray-100 rounded border border-gray-300 text-xs ml-2">2</kbd>
+                      <kbd className="px-2 py-1 bg-gray-100 rounded border border-gray-300 text-xs ml-2">3</kbd>
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              <div className="mt-6 pt-6 border-t border-gray-100 text-sm text-gray-500">
+                <div className="flex justify-between">
+                  <span>Intervalo: {currentCard.interval} {currentCard.interval === 1 ? 'dia' : 'dias'}</span>
+                  <span>Última revisão: {currentCard.lastReviewedAt ? formatDate(currentCard.lastReviewedAt) : 'Nunca'}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
